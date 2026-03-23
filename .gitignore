@@ -1,0 +1,8 @@
+# Extracted SDKs and toolchains (large binaries, do not commit)
+/tools/
+/downloads/
+
+# Compiled binaries
+ch01-simulator-setup/test_hvx_hmx
+ch02-real-device/build/
+ch03-qnn-custom-op/build/

@@ -1,0 +1,29 @@
+========================================
+  Chapter 2: HVX + HMX on Real Device
+========================================
+[Power] Setting up HVX + HMX...
+[Power] OK
+[Init] Allocating VTCM + HMX lock...
+[Init] VTCM total = 8388608 bytes (8192 KB)
+[Init] VTCM=FF000000  HMX locked
+
+-- Test 1: HVX fill -> HMX matmul ----------
+  act: 0x3C00 0x3C00 0x3C00 0x3C00
+  wt : 0x4000 0x4000 0x4000 0x4000
+  out: 0x5410 0x5410 0x5410 0x5410
+  result=65.0  expected~=64.0
+[PASS] Test 1
+
+-- Test 2: HMX matmul -> HVX ReLU ----------
+  matmul: 0xCFC0 0xCFC0 (-31.0)
+  relu:   0x0000 0x0000 (0.0)
+[PASS] Test 2
+
+-- Test 3: Multi-tile accumulation ---------
+  out: 0x5410 0x5410 0x5410 0x5410
+  result=65.0  expected~=64.0
+[PASS] Test 3
+
+========================================
+  Results: 3 PASS / 0 FAIL
+========================================
