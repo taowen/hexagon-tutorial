@@ -158,10 +158,10 @@ static void hvx_relu_f16(unsigned short *buf, int count)
 
 ```bash
 # 编译
-hexagon-clang -O2 -mv73 \
+hexagon-clang -O2 -mv75 \
     -mhvx -mhvx-length=128B \    # 启用 HVX 128B 模式
     -mhmx \                       # 启用 HMX
-    -DARCHV=73 \
+    -DARCHV=75 \
     -I h2-install/include \
     -I hexagon-hypervisor/kernel/include \
     -moslib=h2 \                  # 链接 H2 运行时
@@ -170,7 +170,7 @@ hexagon-clang -O2 -mv73 \
     -o test_hvx_hmx test_hvx_hmx.c
 
 # 运行
-hexagon-sim --mv73 --mhmx 1 --simulated_returnval \
+hexagon-sim --mv75 --mhmx 1 --simulated_returnval \
     -- h2-install/bin/booter \
     --ext_power 1 \               # 上电 HVX/HMX
     --use_ext 1 \                 # 允许 guest 使用 coproc

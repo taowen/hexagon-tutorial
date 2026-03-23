@@ -38,11 +38,11 @@ SRC="$SCRIPT_DIR/test_hvx_hmx.c"
 OUT="$SCRIPT_DIR/test_hvx_hmx"
 
 echo "=== Compiling ==="
-echo "  $CLANG -O2 -mv73 -mhvx -mhvx-length=128B -mhmx ..."
-$CLANG -O2 -mv73 \
+echo "  $CLANG -O2 -mv75 -mhvx -mhvx-length=128B -mhmx ..."
+$CLANG -O2 -mv75 \
     -mhvx -mhvx-length=128B \
     -mhmx \
-    -DARCHV=73 \
+    -DARCHV=75 \
     -I "$H2_INSTALL/include" \
     -I "$H2_KERNEL" \
     -moslib=h2 \
@@ -54,9 +54,9 @@ echo "  -> $OUT"
 # ---- 运行 ----
 echo ""
 echo "=== Running on hexagon-sim ==="
-echo "  $SIM --mv73 --mhmx 1 -- booter ... test_hvx_hmx"
+echo "  $SIM --mv75 --mhmx 1 -- booter ... test_hvx_hmx"
 echo ""
-$SIM --mv73 --mhmx 1 --simulated_returnval \
+$SIM --mv75 --mhmx 1 --simulated_returnval \
     -- "$BOOTER" \
     --ext_power 1 \
     --use_ext 1 \

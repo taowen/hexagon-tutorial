@@ -37,10 +37,38 @@ ARM 端 (Android)                           DSP 端 (CDSP)
 - 第二章：自己管理 VTCM（`HAP_compute_res`）和 HMX 锁
 - 本章：**QNN 框架自动管理** VTCM 和 HMX——你只需要在 tensor signature 中声明 `TCM_Only`
 
+## 安装 QNN SDK
+
+第三章开始需要 QNN SDK（Qualcomm AI Runtime）。运行安装脚本：
+
+```bash
+bash ch03-qnn-custom-op/install_qnn.sh
+```
+
+脚本会从高通官网下载并解压到 `tools/qnn-sdk/`：
+
+```
+下载地址: https://apigwx-aws.qualcomm.com/qsc/public/v1/api/download/software/sdks/
+         Qualcomm_AI_Runtime_Community/All/2.44.0.260225/v2.44.0.260225.zip
+
+解压后目录结构:
+tools/qnn-sdk/
+├── include/QNN/          # 头文件 (QnnInterface.h, QnnTypes.h, ...)
+├── lib/
+│   ├── aarch64-android/  # ARM 端运行时 (libQnnHtp.so, libQnnHtpPrepare.so, ...)
+│   ├── hexagon-v75/
+│   │   └── unsigned/     # DSP 端骨架 (libQnnHtpV75Skel.so)
+│   └── x86_64-linux-clang/  # x86 模拟器用 (第四章)
+└── ...
+```
+
+前两章只需要 Hexagon SDK + H2，从本章开始需要 QNN SDK 来构建和运行 QNN 图。
+
 ## 源代码结构
 
 ```
 ch03-qnn-custom-op/
+├── install_qnn.sh                  # QNN SDK 安装脚本
 ├── src/
 │   ├── dsp/
 │   │   ├── HvxHmxOp.cpp          # 算子内核 (HVX ReLU + HMX matmul)
