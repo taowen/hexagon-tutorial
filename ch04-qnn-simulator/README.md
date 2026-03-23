@@ -1,115 +1,111 @@
-# 第四章：QNN 自定义算子 — 在模拟器上运行 (无需真机)
+# 第四章：QNN 自定义算子 — 用 libnative 在 x86 上模拟 HVX/HMX
 
-本章目标：把第三章的 QNN QHPI 自定义算子（HVX ReLU + HMX matmul）在 x86 主机上运行，通过 QNN 内置的 QEMU Hexagon 模拟器，无需连接 Qualcomm 设备。
+本章目标：使用 QNN 推荐的可移植写法，让同一份 HVX + HMX 自定义算子代码在 x86 主机上通过 `libnative` 直接运行，无需真机。
 
-## 为什么需要模拟器？
+## 和第三章的根本区别
 
-- **无设备开发**：不需要 Qualcomm 手机或开发板，任何 x86_64 Linux 机器都能跑
-- **快速迭代**：省去 adb push / 远程执行的等待时间，编译即运行
-- **CI 友好**：可以在 CI/CD 流水线中自动测试自定义算子，无需物理设备
-- **调试方便**：x86 环境下可以用标准 Linux 调试工具（gdb、valgrind、asan）
+第三章用 `#ifdef __hexagon__` 把代码分成两条路径：
+
+```cpp
+// ch03 的写法 — 不可移植
+#ifdef __hexagon__
+    HVX_Vector v = Q6_V_vzero();              // 只能在 hexagon 上编译
+    Q6_activation_hf_mxmem_RR(addr, 32767);   // 只能在 hexagon 上编译
+#else
+    for (int i = 0; ...) { sum += a[i]*b[i]; } // CPU fallback，完全不同的代码
+#endif
+```
+
+本章改为**单一代码路径**，HVX/HMX intrinsics 在两个平台上都能编译运行：
+
+```cpp
+// ch04 的写法 — 可移植
+#ifdef __hexagon__
+#include <hvx_hexagon_protos.h>    // hexagon 编译器原生支持
+#include <hmx_hexagon_protos.h>
+#else
+#include "hvx_hexagon_protos.h"    // libnative 提供 x86 模拟实现
+#include "hmx_hexagon_protos.h"
+#endif
+
+// 以下代码在两个平台上完全相同
+HVX_Vector v = Q6_V_vzero();
+Q6_activation_hf_mxmem_RR(addr, 32767);
+```
+
+## libnative 是什么？
+
+`libnative` 是 Hexagon SDK 自带的一个静态库（`libnative.a`），它在 x86 上用纯 C/C++ 实现了所有 HVX 和 HMX intrinsics 的功能等价模拟：
+
+| intrinsic | hexagon 上 | x86 + libnative |
+|---|---|---|
+| `Q6_V_vzero()` | 硬件清零 HVX 寄存器 | C++ 实现：`memset(vec, 0, 128)` |
+| `Q6_Vh_vmax_VhVh(a, b)` | 硬件 SIMD max | C++ 循环：逐元素 max |
+| `Q6_activation_hf_mxmem_RR(addr, rt)` | 硬件 HMX 矩阵加载 | C++ 模拟 HMX 累加器状态 |
+| `Q6_mxmem_AR_after_hf(ptr, rt)` | 硬件 HMX 输出写回 | C++ 模拟写回结果 |
+
+关键：**不是 QEMU**，不是指令级仿真。`libnative` 是函数级模拟——每个 intrinsic 调用被替换为等价的 C++ 函数，直接在 x86 上执行。速度比 QEMU 快，但行为在数学上等价。
 
 ## 架构
 
 ```
 x86 主机 (Linux)
-┌─────────────────────────────────────────────────────────────────┐
-│                                                                 │
-│  qnn_hvx_hmx_test          libQnnHtp.so (x86_64)              │
-│  ┌──────────────────┐      ┌──────────────────────────┐        │
-│  │ 1. dlopen backend│─────→│ QNN HTP 后端 (x86 版本)  │        │
-│  │ 2. register op   │      │                          │        │
-│  │ 3. build graph   │      │  libQnnHtpQemu.so        │        │
-│  │ 4. execute       │      │  ┌──────────────────┐    │        │
-│  │ 5. verify result │      │  │ QEMU Hexagon 仿真│    │        │
-│  └──────────────────┘      │  │                  │    │        │
-│                            │  │ libHvxHmxMix_htp │    │        │
-│  libHvxHmxMix_cpu.so      │  │ .so (hex-v75)    │    │        │
-│  (CPU fallback, x86)      │  │                  │    │        │
-│                            │  │ HVX ReLU → HMX  │    │        │
-│                            │  │ matmul → HVX    │    │        │
-│                            │  └──────────────────┘    │        │
-│                            └──────────────────────────┘        │
-└─────────────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────┐
+│                                                               │
+│  qnn_hvx_hmx_test              libQnnHtp.so (x86_64)        │
+│  ┌──────────────────┐          ┌────────────────────────┐    │
+│  │ 1. dlopen backend│─────────→│ QNN HTP 后端 (x86)     │    │
+│  │ 2. register op   │          │                        │    │
+│  │ 3. build graph   │          │ 图编译 + 调度          │    │
+│  │ 4. execute       │          │                        │    │
+│  │ 5. verify result │          │                        │    │
+│  └──────────────────┘          └───────────┬────────────┘    │
+│                                            │ 调用             │
+│                                            ▼                  │
+│                          libHvxHmxMix_htp.so (x86_64)        │
+│                          ┌────────────────────────────┐       │
+│                          │ HVX ReLU → HMX matmul     │       │
+│                          │ → HVX ReLU                 │       │
+│                          │                            │       │
+│                          │ Q6_V_vzero()          ───→ libnative.a 模拟  │
+│                          │ Q6_Vh_vmax_VhVh()     ───→ libnative.a 模拟  │
+│                          │ Q6_activation_hf_mxmem ──→ libnative.a 模拟  │
+│                          │ Q6_mxmem_AR_after_hf  ───→ libnative.a 模拟  │
+│                          └────────────────────────────┘       │
+└───────────────────────────────────────────────────────────────┘
 ```
 
-关键点：
-- **x86 版 libQnnHtp.so** 内部使用 **libQnnHtpQemu.so** 来仿真 Hexagon DSP
-- QEMU 加载并执行 hexagon-v75 编译的 `libHvxHmxMix_htp.so`
-- 从应用程序视角，API 调用方式和真机完全一样
+## 和真机的对比
 
-## 和第三章的区别
-
-| | 第三章 (真机) | 第四章 (模拟器) |
+| | 第三章 (真机) | 第四章 (libnative 模拟) |
 |---|---|---|
 | **运行环境** | Android 设备 (aarch64) | x86_64 Linux 主机 |
-| **QNN 后端** | libQnnHtp.so (aarch64) | libQnnHtp.so (x86_64) + QEMU |
-| **DSP 代码** | 完全相同 | 完全相同 |
-| **CPU fallback** | aarch64 (Android NDK) | x86_64 (系统 g++) |
-| **测试程序** | aarch64 (Android NDK) | x86_64 (系统 gcc) |
-| **Op 包注册** | CPU + HTP 两个 .so | 仅 x86 .so, target=NULL |
+| **HVX/HMX 代码** | hexagon 硬件执行 | libnative C++ 模拟 |
+| **代码路径** | `#ifdef __hexagon__` 分支 | **统一代码路径，无 #ifdef** |
+| **编译 op 包** | hexagon-clang++ | clang++ + libnative.a |
+| **QNN 后端** | libQnnHtp.so (aarch64) → CDSP | libQnnHtp.so (x86_64) |
 | **部署方式** | adb push + adb shell | 本地直接运行 |
-| **DSP 执行** | 真实 CDSP 硬件 | QEMU Hexagon 仿真 |
-
-**DSP 端代码是字节级别完全相同的** — `HvxHmxOp.cpp` 和 `HvxHmxInterface.cpp` 从第三章原封不动复制，hexagon-clang++ 编译参数也一样。区别仅在于：
-1. CPU fallback .so 用系统编译器而非 Android NDK
-2. 测试程序用系统编译器而非 Android NDK
-3. 运行时链接 x86_64 版 QNN 库而非 aarch64 版
-
-### Op 包注册的关键区别
-
-在真机上（ch03），需要分别注册 CPU 和 HTP 两个 .so：
-
-```c
-backendRegisterOpPackage(backend, "libHvxHmxMix_cpu.so", "...", "CPU");
-backendRegisterOpPackage(backend, "libHvxHmxMix_htp.so", "...", "HTP");
-```
-
-在 x86 模拟器上，只需注册一个 x86 编译的 .so，target 设为 `NULL`：
-
-```c
-backendRegisterOpPackage(backend, "libHvxHmxMix_cpu.so", "...", NULL);
-```
-
-原因：x86 HTP 后端不支持 "HTP" target（会报 `RouterX86 not support Op package target HTP`），也不能直接 dlopen hexagon ELF。x86 后端通过 `qhpi_init()` 入口点从 x86 .so 中获取算子定义，然后通过 QEMU 执行实际的 hexagon 代码。
-
-## 源代码结构
-
-```
-ch04-qnn-simulator/
-├── src/
-│   ├── dsp/
-│   │   ├── HvxHmxOp.cpp          # 算子内核 (和 ch03 完全相同)
-│   │   └── HvxHmxInterface.cpp   # QNN 包注册接口 (和 ch03 完全相同)
-│   └── host/
-│       └── qnn_hvx_hmx_test.c    # x86 端测试 (标题改为 Chapter 4)
-├── build.sh                       # 编译脚本 (x86_64 目标)
-├── run_sim.sh                     # 本地运行脚本 (无需 adb)
-├── expected_output/
-│   └── sim_output.txt
-└── README.md
-```
 
 ## 编译
 
-三个编译目标：
-
 ```bash
-# 1. DSP 端 HTP 内核 — 和 ch03 完全一样, hexagon-clang++ 编译
-hexagon-clang++ -mv75 -mhvx -mhmx -shared -fPIC \
+# clang++ 编译 op 包，链接 libnative.a 提供 HVX/HMX 模拟
+clang++ -std=c++17 -O2 -fPIC -shared \
+    -D__HVXDBL__ -DUSE_OS_LINUX \
     -I $QNN_SDK/include/QNN \
-    -o libHvxHmxMix_htp.so  src/dsp/*.cpp
+    -I $HEXAGON_TOOLS/libnative/include \
+    -o libHvxHmxMix_htp.so  src/dsp/*.cpp \
+    -Wl,--whole-archive -lnative -Wl,--no-whole-archive -lpthread
 
-# 2. x86_64 CPU fallback — 用系统 g++ (不是 Android NDK!)
-g++ -shared -fPIC \
-    -I $QNN_SDK/include/QNN \
-    -o libHvxHmxMix_cpu.so  src/dsp/*.cpp \
-    -L $QNN_SDK/lib/x86_64-linux-clang -lQnnHtp -lHtpPrepare
-
-# 3. x86_64 测试程序 — 用系统 gcc
-gcc -I $QNN_SDK/include/QNN \
-    -o qnn_hvx_hmx_test  src/host/*.c -ldl -lm
+# 测试程序
+gcc -I $QNN_SDK/include/QNN -o qnn_hvx_hmx_test src/host/*.c -ldl -lm
 ```
+
+关键编译选项：
+- **`-D__HVXDBL__`** — libnative 要求，启用 128 字节 HVX 模式
+- **`-Wl,--whole-archive -lnative`** — 链接整个 libnative.a，确保所有 intrinsic 符号可用
+- **`-lpthread`** — libnative 内部依赖
+- **不链接 `-lQnnHtp`** — op 包是插件，由后端 dlopen 加载，运行时才解析 QHPI 符号
 
 或直接运行：
 
@@ -122,17 +118,6 @@ bash ch04-qnn-simulator/build.sh
 ```bash
 bash ch04-qnn-simulator/run_sim.sh
 ```
-
-脚本会设置 `LD_LIBRARY_PATH` 并在本地直接执行测试程序。需要的运行时库：
-
-| 库 | 来源 | 用途 |
-|---|---|---|
-| `libHvxHmxMix_cpu.so` | 本地编译 (x86_64) | CPU fallback 包 |
-| `libHvxHmxMix_htp.so` | 本地编译 (hexagon-v75) | DSP 端 HTP 内核 |
-| `libQnnHtp.so` | QNN SDK (x86_64) | QNN HTP 后端 |
-| `libQnnHtpQemu.so` | QNN SDK (x86_64) | QEMU Hexagon 仿真器 |
-| `libHtpPrepare.so` | QNN SDK (x86_64) | HTP 图编译器 |
-| `libQnnHtpV75Skel.so` | QNN SDK (hexagon-v75) | HTP V75 DSP 骨架 |
 
 ## 实验结果
 
@@ -169,14 +154,30 @@ bash ch04-qnn-simulator/run_sim.sh
 ========================================
 ```
 
-模拟器输出和真机完全一致。
+结果和真机完全一致：**HVX ReLU + HMX matmul 在 x86 上通过 libnative 模拟得到了正确结果**。
+
+## 源代码结构
+
+```
+ch04-qnn-simulator/
+├── src/
+│   ├── dsp/
+│   │   ├── HvxHmxOp.cpp          # 统一代码路径 (无 #ifdef __hexagon__)
+│   │   └── HvxHmxInterface.cpp   # QNN 包注册接口
+│   └── host/
+│       └── qnn_hvx_hmx_test.c    # x86 测试程序
+├── build.sh                       # 编译 (clang++ + libnative)
+├── run_sim.sh                     # 运行
+├── expected_output/
+│   └── sim_output.txt
+└── README.md
+```
 
 ## 要点总结
 
-1. **QNN 提供 x86_64 版后端库** — `libQnnHtp.so` (x86) 内部使用 QEMU 仿真 Hexagon
-2. **DSP 代码零修改** — `HvxHmxOp.cpp` 和 `HvxHmxInterface.cpp` 与 ch03 完全相同
-3. **Op 包注册方式不同** — x86 上用 `NULL` target 注册单个 x86 .so，而非分别注册 CPU/HTP
-4. **编译改动极小** — 只需把 Android NDK 换成系统编译器，链接路径换成 x86_64
-5. **无需 adb** — 所有操作在本地完成，适合开发调试和 CI
-6. **QEMU 仿真有局限** — 性能不代表真实硬件，某些时序相关的行为可能不同
-7. **开发工作流推荐** — 先用模拟器快速验证正确性，再到真机验证性能
+1. **libnative 是关键** — Hexagon SDK 自带，在 x86 上函数级模拟所有 HVX/HMX intrinsics
+2. **统一代码路径** — 消除 `#ifdef __hexagon__`，同一份 intrinsic 代码在 hexagon 和 x86 上都能编译运行
+3. **不是 QEMU** — libnative 是 C++ 函数库，比指令仿真快，结果数学等价
+4. **QNN 框架正常工作** — QHPI 注册、图编译、VTCM 分配、graphExecute 全部正常
+5. **开发工作流** — 先用 libnative 在 x86 上快速验证算子正确性，再部署到真机验证性能
+6. **host 端需要 RTLD_GLOBAL** — dlopen 后端时用 `RTLD_GLOBAL`，让 op 包能解析 QHPI 符号

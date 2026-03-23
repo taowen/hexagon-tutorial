@@ -64,7 +64,7 @@ static void* g_backendLib = NULL;
 static QNN_INTERFACE_VER_TYPE g_qnn;
 
 static int load_backend(const char* libPath) {
-    g_backendLib = dlopen(libPath, RTLD_NOW | RTLD_LOCAL);
+    g_backendLib = dlopen(libPath, RTLD_NOW | RTLD_GLOBAL);
     if (!g_backendLib) { printf("ERROR: dlopen: %s\n", dlerror()); return -1; }
     QnnInterfaceGetProvidersFn fn =
         (QnnInterfaceGetProvidersFn)dlsym(g_backendLib, "QnnInterface_getProviders");
@@ -164,12 +164,12 @@ int main(int argc, char** argv) {
     if (err != QNN_SUCCESS) { printf("[FAIL] backendCreate=%lu\n", (unsigned long)err); goto done; }
 
     /* Register custom op package.
-     * On x86 simulator, we register a single x86-compiled .so with NULL target.
-     * The x86 HTP backend uses QEMU for hexagon execution internally.
+     * On x86, we register a single .so compiled with libnative.
+     * HVX/HMX intrinsics are simulated by libnative in-process.
      * On real device (ch03), we register CPU and HTP .so separately. */
     printf("[Register] Custom op packages...\n");
     err = g_qnn.backendRegisterOpPackage(backend,
-        "./libHvxHmxMix_cpu.so", "HvxHmxMixInterfaceProvider", NULL);
+        "./libHvxHmxMix_htp.so", "HvxHmxMixInterfaceProvider", NULL);
     if (err != QNN_SUCCESS) { printf("[FAIL] reg=%lu\n", (unsigned long)err); goto done; }
     printf("[Register] OK\n\n");
 

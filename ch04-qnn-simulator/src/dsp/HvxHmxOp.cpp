@@ -14,6 +14,10 @@
  *   - result:     [1,1,32,32] F16 (VTCM)
  *
  * 流水线: HVX ReLU → HMX matmul → HVX ReLU
+ *
+ * This file uses portable HVX/HMX intrinsics that work on BOTH platforms:
+ *   - On hexagon: native compiler intrinsics
+ *   - On x86: provided by libnative.a + headers in libnative/include/
  */
 
 #include "HTP/core/qhpi.h"
@@ -21,10 +25,15 @@
 #include <cstring>
 
 #ifdef __hexagon__
+// Hexagon compiler provides these natively
 #include <hexagon_types.h>
 #include <hexagon_protos.h>
-#include <hmx_hexagon_protos.h>
 #include <hvx_hexagon_protos.h>
+#include <hmx_hexagon_protos.h>
+#else
+// libnative provides x86 emulation of the same intrinsics
+#include "hvx_hexagon_protos.h"
+#include "hmx_hexagon_protos.h"
 #endif
 
 #define STRINGIZE_DETAIL(X) #X
@@ -35,13 +44,11 @@
  * HMX matmul core
  * activation + weight loads MUST be in same function/VLIW packet
  * ============================================================ */
-#ifdef __hexagon__
 __attribute__((noinline))
-static void hmx_matmul_f16(uint32_t act_addr, uint32_t wt_addr) {
+static void hmx_matmul_f16(uintptr_t act_addr, uintptr_t wt_addr) {
     Q6_activation_hf_mxmem_RR(act_addr, 32767);
     Q6_weight_hf_mxmem_RR(wt_addr, 1920);
 }
-#endif
 
 /* ============================================================
  * Kernel: HvxHmxMix (VTCM + HVX + HMX)
@@ -52,8 +59,8 @@ static uint32_t hvx_hmx_mix_kernel(
     uint32_t num_inputs, const QHPI_Tensor *const *inputs)
 {
     (void)handle;
+    (void)num_outputs; (void)num_inputs;
 
-#ifdef __hexagon__
     /* 获取 VTCM 指针 */
     uint16_t *act_ptr  = (uint16_t *)qhpi_tensor_raw_data(inputs[0]);
     uint16_t *wt_ptr   = (uint16_t *)qhpi_tensor_raw_data(inputs[1]);
@@ -75,8 +82,8 @@ static uint32_t hvx_hmx_mix_kernel(
     Q6_bias_mxmem2_A(bias_ptr);
     Q6_mxclracc_hf();
     hmx_matmul_f16(
-        (uint32_t)(uintptr_t)act_ptr,
-        (uint32_t)(uintptr_t)wt_ptr
+        (uintptr_t)act_ptr,
+        (uintptr_t)wt_ptr
     );
     Q6_mxmem_AR_after_hf(out_ptr, 0);
 
@@ -92,54 +99,6 @@ static uint32_t hvx_hmx_mix_kernel(
     }
 
     return QHPI_Success;
-#else
-    /* ARM-side scalar fallback for graph validation */
-    (void)num_outputs; (void)num_inputs;
-
-    const uint16_t *act = (const uint16_t *)qhpi_tensor_raw_data(inputs[0]);
-    const uint16_t *wt  = (const uint16_t *)qhpi_tensor_raw_data(inputs[1]);
-    uint16_t *out = (uint16_t *)qhpi_tensor_raw_data(outputs[0]);
-
-    auto f16_to_f32 = [](uint16_t h) -> float {
-        uint32_t sign = (uint32_t)(h & 0x8000) << 16;
-        uint32_t exp = (h >> 10) & 0x1F;
-        uint32_t mant = h & 0x03FF;
-        if (exp == 0) { float f = 0; uint32_t r = sign; memcpy(&f, &r, 4); return f; }
-        if (exp == 31) { uint32_t r = sign | 0x7F800000; float f; memcpy(&f, &r, 4); return f; }
-        uint32_t result = sign | ((exp + 112) << 23) | (mant << 13);
-        float f; memcpy(&f, &result, 4); return f;
-    };
-    auto f32_to_f16 = [](float v) -> uint16_t {
-        uint32_t bits; memcpy(&bits, &v, sizeof(float));
-        uint16_t sign = (bits >> 16) & 0x8000;
-        int32_t exp_val = ((bits >> 23) & 0xFF) - 127;
-        uint32_t mant_val = bits & 0x007FFFFF;
-        if (exp_val > 15) return sign | 0x7C00;
-        if (exp_val < -14) return sign;
-        return sign | (uint16_t)((exp_val + 15) << 10) | (uint16_t)(mant_val >> 13);
-    };
-
-    /* Step 1: ReLU on activation (in-place copy) */
-    float act_relu[1024];
-    for (int i = 0; i < 1024; i++) {
-        float v = f16_to_f32(act[i]);
-        act_relu[i] = v > 0 ? v : 0;
-    }
-
-    /* Step 2: matmul */
-    for (int i = 0; i < 32; i++) {
-        for (int j = 0; j < 32; j++) {
-            float sum = 0.0f;
-            for (int k = 0; k < 32; k++)
-                sum += act_relu[i * 32 + k] * f16_to_f32(wt[k * 32 + j]);
-            /* Step 3: ReLU on output */
-            float result = sum > 0 ? sum : 0;
-            out[i * 32 + j] = f32_to_f16(result);
-        }
-    }
-
-    return QHPI_Success;
-#endif
 }
 
 /* ============================================================

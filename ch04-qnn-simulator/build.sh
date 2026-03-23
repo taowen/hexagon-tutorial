@@ -1,69 +1,52 @@
 #!/usr/bin/env bash
 #
-# build.sh — 编译第四章 QNN 自定义算子 (x86 模拟器版本)
+# build.sh — Build chapter 4 QNN custom op (x86 simulator via libnative)
 #
-# 产出:
-#   build/hexagon-v75/libHvxHmxMix_htp.so  — DSP 端 (HTP 内核, hexagon binary)
-#   build/x86_64/libHvxHmxMix_cpu.so       — x86 端 (CPU fallback)
-#   build/x86_64/qnn_hvx_hmx_test          — x86 端测试程序
+# Output:
+#   build/x86_64/libHvxHmxMix_htp.so  — HTP op package (HVX/HMX via libnative simulation on x86)
+#   build/x86_64/qnn_hvx_hmx_test     — Host test program
 #
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# ---- 工具路径 ----
+# ---- Tool paths ----
 QNN_SDK="/tmp/qnn_sdk/qairt/2.44.0.260225"
 HEXAGON_SDK="$ROOT_DIR/tools/hexagon-sdk"
 HEXAGON_TOOLS="$HEXAGON_SDK/tools/HEXAGON_Tools/19.0.04/Tools"
-
-HEX_CXX="$HEXAGON_TOOLS/bin/hexagon-clang++"
 LIBNATIVE="$HEXAGON_TOOLS/libnative"
 
 PACKAGE_NAME=HvxHmxMixPackage
 
-# 检查工具
-for f in "$HEX_CXX" "$QNN_SDK/include/QNN/QnnInterface.h"; do
+# ---- Check tools exist ----
+for f in \
+    "$QNN_SDK/include/QNN/QnnInterface.h" \
+    "$LIBNATIVE/lib/libnative.a" \
+    "$LIBNATIVE/include/hvx_hexagon_protos.h"; do
     if [ ! -f "$f" ]; then
         echo "ERROR: $f not found"
         exit 1
     fi
 done
 
-echo "=== Building QNN Custom Op for Simulator (x86_64) ==="
+for cmd in clang++ gcc; do
+    if ! command -v "$cmd" &>/dev/null; then
+        echo "ERROR: $cmd not found in PATH"
+        exit 1
+    fi
+done
 
-# ---- DSP 端 .so (Hexagon V75) ----
-# 和 ch03 完全一样: hexagon-clang++ 编译, 在 QEMU 中运行
+echo "=== Building QNN Custom Op for Simulator (x86_64 via libnative) ==="
+
+# ---- x86_64 HTP op package (.so with libnative) ----
+# Uses clang++ and links libnative.a so the SAME HVX/HMX intrinsics
+# that would run on real Hexagon DSP work on x86 via simulation.
 echo ""
-echo "--- DSP package (hexagon-v75) ---"
-mkdir -p "$SCRIPT_DIR/build/hexagon-v75"
-
-$HEX_CXX -std=c++17 -O2 -fPIC -shared \
-    -mhvx -mhvx-length=128B -mhmx -mv75 \
-    -DUSE_OS_QURT -DPREPARE_DISABLED \
-    -DTHIS_PKG_NAME=$PACKAGE_NAME \
-    -I"$QNN_SDK/include/QNN" \
-    -I"$HEXAGON_SDK/rtos/qurt/computev75/include/qurt" \
-    -I"$HEXAGON_SDK/rtos/qurt/computev75/include/posix" \
-    -I"$HEXAGON_SDK/incs" \
-    -I"$HEXAGON_SDK/incs/stddef" \
-    -Wall -Wno-missing-braces -Wno-unused-function -Wno-format \
-    -Wno-unused-command-line-argument -fvisibility=default -stdlib=libc++ \
-    '-DQNN_API=__attribute__((visibility("default")))' \
-    '-D__QAIC_HEADER_EXPORT=__attribute__((visibility("default")))' \
-    -o "$SCRIPT_DIR/build/hexagon-v75/libHvxHmxMix_htp.so" \
-    "$SCRIPT_DIR/src/dsp/HvxHmxInterface.cpp" \
-    "$SCRIPT_DIR/src/dsp/HvxHmxOp.cpp"
-
-echo "  -> build/hexagon-v75/libHvxHmxMix_htp.so"
-
-# ---- x86_64 端 .so (CPU fallback + interface) ----
-# 关键区别: 用系统 clang++ 编译, 链接 x86_64 QNN 库
-echo ""
-echo "--- CPU fallback package (x86_64-linux) ---"
+echo "--- HTP op package (x86_64 via libnative) ---"
 mkdir -p "$SCRIPT_DIR/build/x86_64"
 
-g++ -std=c++17 -O2 -fPIC -shared \
+clang++ -std=c++17 -O2 -fPIC -shared \
     -D__HVXDBL__ -DUSE_OS_LINUX -DPREPARE_DISABLED \
     -DTHIS_PKG_NAME=$PACKAGE_NAME \
     -I"$QNN_SDK/include/QNN" \
@@ -73,16 +56,17 @@ g++ -std=c++17 -O2 -fPIC -shared \
     -Wno-invalid-offsetof -Wno-unused-variable -Wno-unused-parameter \
     '-DQNN_API=__attribute__((visibility("default")))' \
     '-D__QAIC_HEADER_EXPORT=__attribute__((visibility("default")))' \
-    -o "$SCRIPT_DIR/build/x86_64/libHvxHmxMix_cpu.so" \
+    -o "$SCRIPT_DIR/build/x86_64/libHvxHmxMix_htp.so" \
     "$SCRIPT_DIR/src/dsp/HvxHmxInterface.cpp" \
     "$SCRIPT_DIR/src/dsp/HvxHmxOp.cpp" \
-    -L"$QNN_SDK/lib/x86_64-linux-clang" -lQnnHtp -lHtpPrepare
+    -Wl,--whole-archive -L"$LIBNATIVE/lib" -lnative -Wl,--no-whole-archive \
+    -lpthread
 
-echo "  -> build/x86_64/libHvxHmxMix_cpu.so"
+echo "  -> build/x86_64/libHvxHmxMix_htp.so"
 
-# ---- x86_64 端测试程序 ----
+# ---- Host test program ----
 echo ""
-echo "--- Host test app (x86_64-linux) ---"
+echo "--- Host test app (x86_64) ---"
 
 gcc -O2 -Wall -std=c11 \
     -I"$QNN_SDK/include/QNN" \
