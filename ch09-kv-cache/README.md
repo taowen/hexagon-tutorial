@@ -252,7 +252,7 @@ Genie 优化：将 mask 操作融入 softmax 内部，当有效 token 只占 ctx
 | QNN_TENSOR_DATA_FORMAT_HMX_WEIGHT_LAYOUT | ✗ | ✗ | ✓ |
 | NativeKV Cache | ✗ | ✗ | ✓ |
 
-NativeKV 依赖 NPU 能**直接消费** WH 布局的 tensor。v73 虽然有 HMX，但 QNN 编译器不支持将 KV I/O tensor 标记为 `HMX_WEIGHT_LAYOUT` 格式。只有 v75+（Snapdragon 8 Elite / 8s Elite）才完整支持。
+NativeKV 依赖 NPU 能**直接消费** WH 布局的 tensor。v73 虽然有 HMX，但 QNN 编译器不支持将 KV I/O tensor 标记为 `HMX_WEIGHT_LAYOUT` 格式。只有 v75+（Snapdragon 8 Gen 3 为 v75，Snapdragon 8 Elite 为 v79）才完整支持。
 
 ### Genie 的自动检测
 
