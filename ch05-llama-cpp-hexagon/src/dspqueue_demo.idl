@@ -1,0 +1,36 @@
+/*
+ * ch05: dspqueue demo — FastRPC IDL
+ *
+ * 和 llama.cpp 的 htp_iface.idl 一样，FastRPC 只用于生命周期管理：
+ *   - start: 传递 dspqueue ID 给 DSP
+ *   - stop:  关闭 DSP 端队列
+ *   - do_op: FastRPC 对比路径（每次调用走内核态）
+ *
+ * 对比 llama.cpp:
+ *   interface htp_iface : remote_handle64 {
+ *       AEEResult start(in uint32 sess_id, in uint64 dsp_queue_id,
+ *                        in uint32 n_hvx, in uint32 use_hmx);
+ *       AEEResult stop();
+ *   };
+ */
+
+#ifndef DSPQUEUE_DEMO_IDL
+#define DSPQUEUE_DEMO_IDL
+
+#include "AEEStdDef.idl"
+#include "remote.idl"
+
+interface dspqueue_demo : remote_handle64 {
+
+    /* 启动 DSP 端：导入 dspqueue，开始监听消息 */
+    AEEResult start(in uint64 dsp_queue_id);
+
+    /* 停止 DSP 端：关闭 dspqueue，返回累计处理时间 */
+    AEEResult stop(rout uint64 process_time);
+
+    /* FastRPC 对比路径：每次调用都走内核态，用于 benchmark */
+    AEEResult do_op(in sequence<uint8> input, rout sequence<uint8> output,
+                    in uint32 op, rout uint64 process_time);
+};
+
+#endif

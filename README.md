@@ -8,11 +8,12 @@
 - [第二章：在真机上跑 HVX + HMX](ch02-real-device/) — 骁龙 8 Gen 3 CDSP
 - [第三章：QNN 自定义算子 (HVX+HMX)](ch03-qnn-custom-op/) — QHPI Custom Op（真机）
 - [第四章：QNN 自定义算子 x86 模拟](ch04-qnn-simulator/) — libnative 模拟 HVX/HMX
+- [第五章：llama.cpp 的 Hexagon 后端](ch05-llama-cpp-hexagon/) — dspqueue 替代 FastRPC，全 DSP 推理
 
 ## 环境要求
 
 - x86_64 Linux + Hexagon SDK 6.4.0.2
-- 第二、三章额外需要：骁龙 8 Gen 3（或更新）手机 + adb
+- 第二、三、五章额外需要：骁龙 8 Gen 3（或更新）手机 + adb
 - 第三、四章额外需要：QNN SDK (QAIRT) 2.44+
 
 ## 快速开始
@@ -35,4 +36,8 @@ bash ch03-qnn-custom-op/run_device.sh
 # 第四章: QNN 自定义算子 (x86 模拟)
 bash ch04-qnn-simulator/build.sh
 bash ch04-qnn-simulator/run_sim.sh
+
+# 第五章: llama.cpp Hexagon 后端 (真机)
+bash ch05-llama-cpp-hexagon/build.sh
+bash ch05-llama-cpp-hexagon/run_device.sh model.gguf
 ```
