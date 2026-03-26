@@ -1,0 +1,32 @@
+/*
+ * ch12: MNIST Training -- FastRPC IDL
+ *
+ * FastRPC is used for:
+ *   - start/stop: lifecycle management + dspqueue ID passing
+ *   - do_matmul:  FastRPC comparison path (kernel transition each time)
+ *
+ * dspqueue path bypasses FastRPC for matmul, only uses FastRPC once at start.
+ */
+
+#ifndef MNIST_TRAIN_IDL
+#define MNIST_TRAIN_IDL
+
+#include "AEEStdDef.idl"
+#include "remote.idl"
+
+interface mnist_train : remote_handle64 {
+
+    /* Start DSP side: import dspqueue, begin listening */
+    AEEResult start(in uint64 dsp_queue_id);
+
+    /* Stop DSP side: close dspqueue, return cumulative process time (us) */
+    AEEResult stop(rout uint64 process_time);
+
+    /* FastRPC matmul path: each call goes through kernel transition */
+    AEEResult do_matmul(in sequence<uint8> a_buf, in sequence<uint8> b_buf,
+                        rout sequence<uint8> c_buf,
+                        in uint32 m, in uint32 n, in uint32 k, in uint32 transpose,
+                        rout uint64 process_time);
+};
+
+#endif
