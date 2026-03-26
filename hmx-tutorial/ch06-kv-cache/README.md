@@ -18,10 +18,10 @@ ch09-kv-cache/
 
 ## 环境准备
 
-需要 ch08 的 HexKL addon（`tools/hexkl-addon/`）。如未安装：
+需要第五章的 HexKL addon（`tools/hexkl-addon/`）。如未安装：
 
 ```bash
-cd ../ch08-hexkl-matmul && bash install_hexkl.sh
+cd ../ch05-hexkl-matmul && bash install_hexkl.sh
 ```
 
 ## 构建和运行

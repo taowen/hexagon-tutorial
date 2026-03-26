@@ -9,7 +9,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 QNN_SDK="/tmp/qnn_sdk/qairt/2.44.0.260225"
 
 BUILD_DIR="$SCRIPT_DIR/build/x86_64"

@@ -13,7 +13,7 @@ set -euo pipefail
 
 # ---- 路径（和 ch01-ch04 保持一致） ----
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 SRC="$SCRIPT_DIR/src"
 BUILD="$SCRIPT_DIR/build"
 
