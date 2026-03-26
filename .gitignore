@@ -5,9 +5,4 @@
 # Compiled binaries
 ch01-simulator-setup/test_hvx_hmx
 ch02-real-device/build/
-ch03-qnn-custom-op/build/
-ch05-llama-cpp-hexagon/build/
-ch06-vtcm-memory/build/
-ch07-qnn-vtcm/build/
-ch08-hexkl-matmul/build/
-ch09-kv-cache/build/
+**/build/

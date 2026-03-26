@@ -5,7 +5,7 @@
 #ifndef MNIST_DATA_H
 #define MNIST_DATA_H
 
-#include "mnist_common.h"
+#include "common/common.h"
 
 /* ====================================================================
  * MNIST IDX file loading

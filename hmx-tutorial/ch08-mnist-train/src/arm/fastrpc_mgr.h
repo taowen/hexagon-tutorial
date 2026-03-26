@@ -7,12 +7,12 @@
 #ifndef FASTRPC_MGR_H
 #define FASTRPC_MGR_H
 
-#include "mnist_common.h"
+#include "common/common.h"
 
 #include <rpcmem.h>
 #include <AEEStdErr.h>
 #include "mnist_train.h"
-#include "mnist_train_shared.h"
+#include "common/protocol.h"
 
 /* --- FastRPC context --- */
 static remote_handle64 g_fastrpc_handle = -1;

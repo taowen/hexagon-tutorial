@@ -5,8 +5,8 @@
 #ifndef MNIST_NETWORK_H
 #define MNIST_NETWORK_H
 
-#include "mnist_common.h"
-#include "mnist_cpu_matmul.h"
+#include "common/common.h"
+#include "arm/cpu_matmul.h"
 
 /* ====================================================================
  * Network init / free
@@ -81,6 +81,31 @@ static void relu_forward(float *x, int n) {
         if (x[i] < 0.0f) x[i] = 0.0f;
 }
 
+static void relu_backward(float *dx, const float *pre_relu, int n) {
+    for (int i = 0; i < n; i++)
+        if (pre_relu[i] <= 0.0f)
+            dx[i] = 0.0f;
+}
+
+static void bias_backward(float *db, const float *dout, int batch, int dim) {
+    for (int j = 0; j < dim; j++) {
+        float acc = 0.0f;
+        for (int b = 0; b < batch; b++)
+            acc += dout[b * dim + j];
+        db[j] = acc;
+    }
+}
+
+static void compute_dlogits(float *dlogits, const float *probs,
+                            const uint8_t *labels, int batch, int dim) {
+    memcpy(dlogits, probs, batch * dim * sizeof(float));
+    for (int b = 0; b < batch; b++) {
+        dlogits[b * dim + labels[b]] -= 1.0f;
+        for (int j = 0; j < dim; j++)
+            dlogits[b * dim + j] /= (float)batch;
+    }
+}
+
 static float softmax_cross_entropy(const float *logits, const uint8_t *labels,
                                    float *probs, int batch) {
     float total_loss = 0.0f;
@@ -136,46 +161,35 @@ static void forward(network_t *net, const float *input, int batch,
 
 static void backward(network_t *net, const float *input, const uint8_t *labels,
                      int batch, matmul_fn_t matmul) {
-    /* dlogits = probs - one_hot(labels) / batch */
-    memcpy(net->dlogits, net->probs, batch * OUTPUT_DIM_PAD * sizeof(float));
-    for (int b = 0; b < batch; b++) {
-        net->dlogits[b * OUTPUT_DIM_PAD + labels[b]] -= 1.0f;
-        for (int j = 0; j < OUTPUT_DIM_PAD; j++)
-            net->dlogits[b * OUTPUT_DIM_PAD + j] /= (float)batch;
-    }
+    /* dlogits = (probs - one_hot(labels)) / batch */
+    compute_dlogits(net->dlogits, net->probs, labels, batch, OUTPUT_DIM_PAD);
 
     /* dW2 += dlogits^T @ hidden (transpose=2: C += A^T @ B) */
     matmul(net->dw2, net->dlogits, net->hidden,
            OUTPUT_DIM_PAD, HIDDEN_DIM, batch, 2);
 
     /* db2 += sum_rows(dlogits) */
-    for (int j = 0; j < OUTPUT_DIM_PAD; j++) {
-        float acc = 0.0f;
-        for (int b = 0; b < batch; b++)
-            acc += net->dlogits[b * OUTPUT_DIM_PAD + j];
-        net->db2[j] += acc;
-    }
+    float db2_tmp[OUTPUT_DIM_PAD];
+    bias_backward(db2_tmp, net->dlogits, batch, OUTPUT_DIM_PAD);
+    for (int j = 0; j < OUTPUT_DIM_PAD; j++)
+        net->db2[j] += db2_tmp[j];
 
     /* dhidden = dlogits @ W2 (transpose=0: C = A @ B) */
     matmul(net->dhidden, net->dlogits, net->w2,
            batch, HIDDEN_DIM, OUTPUT_DIM_PAD, 0);
 
     /* ReLU backward */
-    for (int i = 0; i < batch * HIDDEN_DIM; i++)
-        if (net->hidden_pre_relu[i] <= 0.0f)
-            net->dhidden[i] = 0.0f;
+    relu_backward(net->dhidden, net->hidden_pre_relu, batch * HIDDEN_DIM);
 
     /* dW1 += dhidden^T @ input (transpose=2: C += A^T @ B) */
     matmul(net->dw1, net->dhidden, input,
            HIDDEN_DIM, INPUT_DIM_PAD, batch, 2);
 
     /* db1 += sum_rows(dhidden) */
-    for (int j = 0; j < HIDDEN_DIM; j++) {
-        float acc = 0.0f;
-        for (int b = 0; b < batch; b++)
-            acc += net->dhidden[b * HIDDEN_DIM + j];
-        net->db1[j] += acc;
-    }
+    float db1_tmp[HIDDEN_DIM];
+    bias_backward(db1_tmp, net->dhidden, batch, HIDDEN_DIM);
+    for (int j = 0; j < HIDDEN_DIM; j++)
+        net->db1[j] += db1_tmp[j];
 }
 
 /* ====================================================================

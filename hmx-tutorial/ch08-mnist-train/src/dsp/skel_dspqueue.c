@@ -5,9 +5,9 @@
  * The FastRPC matmul function is stubbed out.
  */
 
-#include "dsp_common.h"
-#include "hvx_matmul.h"
-#include "mnist_train_shared.h"
+#include "dsp/skel_common.h"
+#include "dsp/hvx_matmul.h"
+#include "common/protocol.h"
 
 /* ---------- DSP context ---------- */
 struct mnist_context {

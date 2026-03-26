@@ -6,8 +6,8 @@
  * The dspqueue functions (start/stop) are stubbed out.
  */
 
-#include "dsp_common.h"
-#include "hvx_matmul.h"
+#include "dsp/skel_common.h"
+#include "dsp/hvx_matmul.h"
 
 /* ---------- DSP context (minimal) ---------- */
 struct mnist_context {

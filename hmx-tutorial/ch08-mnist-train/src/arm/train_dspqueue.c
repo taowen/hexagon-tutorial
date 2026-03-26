@@ -21,11 +21,11 @@
  *   Default: 5 epochs, 32 batch size
  */
 
-#include "mnist_common.h"
-#include "mnist_data.h"
-#include "mnist_cpu_matmul.h"
-#include "mnist_network.h"
-#include "dspqueue_mgr.h"
+#include "common/common.h"
+#include "arm/data.h"
+#include "arm/cpu_matmul.h"
+#include "arm/network.h"
+#include "arm/dspqueue_mgr.h"
 
 #ifndef CDSP_DOMAIN_ID
 #define CDSP_DOMAIN_ID 3

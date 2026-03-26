@@ -8,15 +8,15 @@
 #ifndef DSPQUEUE_MGR_H
 #define DSPQUEUE_MGR_H
 
-#include "mnist_common.h"
-#include "mnist_network.h"
+#include "common/common.h"
+#include "arm/network.h"
 
 #include <semaphore.h>
 #include <rpcmem.h>
 #include <AEEStdErr.h>
 #include "dspqueue.h"
 #include "mnist_train.h"
-#include "mnist_train_shared.h"
+#include "common/protocol.h"
 
 /* ====================================================================
  * Shared memory registry
@@ -25,7 +25,7 @@
  * The registry maps pointer -> fd for zero-copy dspqueue dispatch.
  * ==================================================================== */
 
-#define MAX_SHARED_BUFS 20
+#define MAX_SHARED_BUFS 40
 
 struct shared_buf_entry {
     void *ptr;

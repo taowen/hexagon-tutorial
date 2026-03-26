@@ -13,6 +13,15 @@
 #define OP_TRAIN_BATCH     3   /* fused forward+backward+SGD */
 #define OP_SYNC            4   /* flush DSP caches for weight buffers */
 
+/* Test op codes for adjoint testing on DSP */
+#define OP_TEST_RELU_FWD   10  /* bufs: [x_inout], params: n */
+#define OP_TEST_RELU_BWD   11  /* bufs: [dx_inout, pre_relu], params: n */
+#define OP_TEST_BIAS_BWD   12  /* bufs: [dout, db_out], params: batch, dim */
+#define OP_TEST_ADD_BIAS   13  /* bufs: [out_inout, bias], params: batch, dim */
+#define OP_TEST_SOFTMAX_CE 14  /* bufs: [logits, probs_out], params: batch, labels[] */
+#define OP_TEST_DLOGITS    15  /* bufs: [dlogits_out, probs], params: batch, labels[] */
+#define OP_TEST_SGD        16  /* bufs: [w_inout, grad], params: n, lr_bits */
+
 /* Buffer indices for OP_REGISTER_NET (12 buffers) */
 #define NET_BUF_W1          0
 #define NET_BUF_B1          1
@@ -81,7 +90,24 @@ struct train_batch_rsp {
     uint32_t correct;
 };
 
-#define MATMUL_MAX_MESSAGE_SIZE  sizeof(struct train_batch_req)
+/* Test op request (OP_TEST_*) */
+struct test_op_req {
+    uint32_t op;
+    uint32_t param1;       /* n or batch_size */
+    uint32_t param2;       /* dim (for bias ops) */
+    uint32_t reserved;
+    uint8_t  labels[256];  /* for softmax/dlogits */
+};
+
+/* Test op response */
+struct test_op_rsp {
+    uint32_t op;
+    uint32_t status;
+    float    result;       /* loss for softmax_ce */
+    uint32_t reserved;
+};
+
+#define MATMUL_MAX_MESSAGE_SIZE  sizeof(struct test_op_req)
 #define MATMUL_MAX_BUFFERS       12
 
 #endif /* MNIST_TRAIN_SHARED_H */

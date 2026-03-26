@@ -5,7 +5,7 @@
 #ifndef MNIST_CPU_MATMUL_H
 #define MNIST_CPU_MATMUL_H
 
-#include "mnist_common.h"
+#include "common/common.h"
 
 /* ====================================================================
  * CPU matmul implementations
