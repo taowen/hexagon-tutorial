@@ -1,9 +1,17 @@
 /*
- * HMX f16 Matmul (via HexKL micro API)
+ * HMX f16 Matmul -- weight-cached (L1 optimization)
  *
  * Extracted from mnist_train_dsp.c for readability.
  * All functions are static -- this header is intended to be included
  * by exactly one translation unit.
+ *
+ * Optimization: pre-load ALL weight tiles into VTCM in WH format
+ * before the compute loop. This eliminates redundant DDR reads and
+ * is the only optimization with measurable benefit at MNIST scale
+ * (~39% on Fwd L1, ~5% on total training time).
+ *
+ * See ch05 demo_llama_hmx.c for the benchmark that proved inline ASM
+ * and bias=mxmem2 add ~0% at this matrix scale.
  *
  * Requires hvx_matmul.h to be included first (for g_scratch, MAX_SCRATCH).
  */
@@ -23,89 +31,86 @@ static uint32_t g_vtcm_size;
  * Largest matrix in training: batch=256, hidden=128, input=784
  *   A max: 256*800 = 204800, B max: 128*800 = 102400 */
 #define HMX_MAX_ELEMS (256 * 800)
-static _Float16 g_a_f16[HMX_MAX_ELEMS];
-static _Float16 g_b_f16[HMX_MAX_ELEMS];
-static float    g_hmx_out[HMX_MAX_ELEMS];  /* temp output for accumulate mode */
+static _Float16 g_a_f16[HMX_MAX_ELEMS] __attribute__((aligned(128)));
+static _Float16 g_b_f16[HMX_MAX_ELEMS] __attribute__((aligned(128)));
+static float    g_hmx_out[HMX_MAX_ELEMS] __attribute__((aligned(128)));  /* temp output for accumulate mode */
 
 /*
  * Core HMX tiled matmul: C[m x n] = A[m x k] @ B[k x n]
  *
  * A and B are f32 inputs; internally converted to f16 for HMX.
- * Output C is f32.  Uses the same tiling pattern as ch08 demo_micro.c.
+ * Output C is f32.
+ *
+ * Weight-cached: pre-load ALL weight tiles into VTCM in WH format
+ * before the row loop, eliminating DDR reads in the inner loop.
  *
  * VTCM layout:
- *   [act tile 0][act tile 1]...[act tile K-1][weight tile][scratch][...][hmx_config]
+ *   [act 0..K-1][staging][readback][wt_0_0..wt_Nc*K][hmx_config]
  */
 static void hmx_matmul_f16(
     uint8_t *vtcm_base, uint32_t vtcm_size,
     float *C, const float *A, const float *B,
     uint32_t m, uint32_t n, uint32_t k)
 {
-    /* Convert f32 inputs to f16 */
-    for (uint32_t i = 0; i < m * k; i++) g_a_f16[i] = (_Float16)A[i];
-    for (uint32_t i = 0; i < k * n; i++) g_b_f16[i] = (_Float16)B[i];
+    /* Convert f32 inputs to f16 (HVX vectorized) */
+    hvx_f32_to_f16(g_a_f16, A, m * k);
+    hvx_f32_to_f16(g_b_f16, B, k * n);
 
-    /* Number of 32-wide tiles across the inner dimension */
-    const uint32_t row_tiles_in_A =
-        (k + HEXKL_HMX_F16_BLOCK_N_INNER - 1) / HEXKL_HMX_F16_BLOCK_N_INNER;
+    const uint32_t K  = (k + HEXKL_HMX_F16_BLOCK_N_INNER - 1) / HEXKL_HMX_F16_BLOCK_N_INNER;
+    const uint32_t Nc = (n + HEXKL_HMX_F16_BLOCK_N_COL - 1) / HEXKL_HMX_F16_BLOCK_N_COL;
+    const uint32_t ALIGN = HEXKL_HMX_ACTIVATION_ALIGNMENT;
 
-    /* Weight tile sits right after activation tiles in VTCM */
-    const uint32_t weight_offset =
-        HEXKL_HMX_ACTIVATION_ALIGNMENT * row_tiles_in_A;
+    /* VTCM offsets */
+    const uint32_t staging_off  = ALIGN * K;
+    const uint32_t readback_off = ALIGN * (K + 1);
+    const uint32_t wt_base      = ALIGN * (K + 2);
 
     /* HMX config at end of VTCM */
-    uint32_t hmx_config_offset = vtcm_size - hexkl_micro_hmx_config_size();
-    hexkl_micro_hmx_setup_acc_read_f16(vtcm_base, hmx_config_offset);
+    uint32_t cfg_off = vtcm_size - hexkl_micro_hmx_config_size();
+    hexkl_micro_hmx_setup_acc_read_f16(vtcm_base, cfg_off);
 
-    /* Triple-nested tiling loop */
+    /* Pre-cache ALL weight tiles into VTCM in WH format */
+    for (uint32_t ct = 0; ct < Nc; ct++)
+        for (uint32_t kt = 0; kt < K; kt++)
+            hexkl_micro_hmx_rm_to_wh_f16(
+                vtcm_base, wt_base + (ct * K + kt) * ALIGN,
+                g_b_f16, kt, ct, n);
+
+    /* Row loop */
     for (uint32_t row = 0; row < m; row += HEXKL_HMX_F16_BLOCK_N_ROW) {
 
         /* Load activation strip into VTCM and convert to AH layout */
-        for (uint32_t i = 0; i < row_tiles_in_A; i++) {
+        for (uint32_t i = 0; i < K; i++) {
             hexkl_micro_hmx_copy_submatrix_to_f16(
-                vtcm_base,
-                HEXKL_HMX_ACTIVATION_ALIGNMENT * (row_tiles_in_A + i),
-                g_a_f16,
-                row / HEXKL_HMX_F16_BLOCK_N_ROW,
-                i,
+                vtcm_base, staging_off,
+                g_a_f16, row / HEXKL_HMX_F16_BLOCK_N_ROW, i,
                 m, k);
             hexkl_micro_hmx_rm_to_ah_f16(
-                vtcm_base,
-                HEXKL_HMX_ACTIVATION_ALIGNMENT * i,
-                HEXKL_HMX_ACTIVATION_ALIGNMENT * (row_tiles_in_A + i));
+                vtcm_base, ALIGN * i, staging_off);
         }
 
+        /* Column loop */
         for (uint32_t col = 0; col < n; col += HEXKL_HMX_F16_BLOCK_N_COL) {
+            uint32_t ct = col / HEXKL_HMX_F16_BLOCK_N_COL;
 
             hexkl_micro_hmx_acc_clear_f16();
 
-            /* Accumulate across K dimension */
-            for (uint32_t i = 0; i < row_tiles_in_A; i++) {
-                hexkl_micro_hmx_rm_to_wh_f16(
-                    vtcm_base, weight_offset,
-                    g_b_f16, i,
-                    col / HEXKL_HMX_F16_BLOCK_N_COL,
-                    n);
+            /* Accumulate across K dimension using cached weight tiles */
+            for (uint32_t i = 0; i < K; i++) {
                 hexkl_micro_hmx_mm_f16(
-                    vtcm_base,
-                    HEXKL_HMX_ACTIVATION_ALIGNMENT * i,
-                    weight_offset);
+                    vtcm_base, ALIGN * i,
+                    wt_base + (ct * K + i) * ALIGN);
             }
 
             /* Read accumulator and convert back to row-major f32 */
             hexkl_micro_hmx_acc_read_f16(
-                vtcm_base, hmx_config_offset,
-                HEXKL_HMX_ACTIVATION_ALIGNMENT * (row_tiles_in_A + 1));
+                vtcm_base, cfg_off, readback_off);
             hexkl_micro_hmx_ah_to_rm_f16(
-                vtcm_base,
-                HEXKL_HMX_ACTIVATION_ALIGNMENT * row_tiles_in_A,
-                HEXKL_HMX_ACTIVATION_ALIGNMENT * (row_tiles_in_A + 1));
+                vtcm_base, staging_off, readback_off);
             hexkl_micro_hmx_copy_f16_to_f32_submatrix(
-                vtcm_base,
-                HEXKL_HMX_ACTIVATION_ALIGNMENT * row_tiles_in_A,
-                C,
+                vtcm_base, staging_off, C,
                 row / HEXKL_HMX_F16_BLOCK_N_ROW,
-                col / HEXKL_HMX_F16_BLOCK_N_COL,
+                ct,
                 m, n);
         }
     }
@@ -146,7 +151,7 @@ static void hmx_matmul_dispatch(
             for (uint32_t p = 0; p < k; p++)
                 g_scratch[i * k + p] = A[p * m + i];
         hmx_matmul_f16(vtcm_base, vtcm_size, g_hmx_out, g_scratch, B, m, n, k);
-        for (uint32_t i = 0; i < m * n; i++) C[i] += g_hmx_out[i];
+        for (uint32_t idx = 0; idx < m * n; idx++) C[idx] += g_hmx_out[idx];
         break;
     }
 

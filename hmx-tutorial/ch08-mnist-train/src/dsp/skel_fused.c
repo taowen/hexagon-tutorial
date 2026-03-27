@@ -24,6 +24,9 @@ struct mnist_context {
     float   *net_bufs[NET_BUF_COUNT];
     int      net_fds[NET_BUF_COUNT];
     int      net_registered;
+#ifdef USE_HMX
+    int      hmx_initialized;
+#endif
 };
 
 
@@ -70,13 +73,38 @@ static void packet_callback(dspqueue_t queue, int error, void *context) {
 
         uint32_t op = msg.reg.op;  /* op is always first field */
 
+#ifdef USE_HMX
+        /* Lazy HMX init in callback thread (HMX lock is thread-local) */
+        if (!ctx->hmx_initialized) {
+            int hmx_err = hexkl_micro_hw_init(&g_vtcm_base, &g_vtcm_size);
+            if (hmx_err == AEE_SUCCESS) {
+                hmx_err = hexkl_micro_hmx_lock();
+            }
+            if (hmx_err == AEE_SUCCESS) {
+                ctx->hmx_initialized = 1;
+                FARF(HIGH, "HMX initialized in callback: VTCM %u KB", g_vtcm_size / 1024);
+            } else {
+                FARF(ERROR, "HMX init failed: 0x%08x", (unsigned)hmx_err);
+            }
+        }
+#endif
+
         if (op == OP_MATMUL && n_bufs >= 3) {
             struct matmul_req *mreq = (struct matmul_req *)&msg;
+#ifdef USE_HMX
+            hmx_matmul_dispatch(g_vtcm_base, g_vtcm_size,
+                (float *)bufs[2].ptr,
+                (const float *)bufs[0].ptr,
+                (const float *)bufs[1].ptr,
+                mreq->m, mreq->n, mreq->k,
+                mreq->transpose, mreq->accumulate);
+#else
             do_matmul((float *)bufs[2].ptr,
                       (const float *)bufs[0].ptr,
                       (const float *)bufs[1].ptr,
                       mreq->m, mreq->n, mreq->k,
                       mreq->transpose, mreq->accumulate);
+#endif
             struct dspqueue_buffer rsp_bufs[3];
             memset(rsp_bufs, 0, sizeof(rsp_bufs));
             rsp_bufs[0].fd = bufs[0].fd;
@@ -139,7 +167,12 @@ static void packet_callback(dspqueue_t queue, int error, void *context) {
             /* === FORWARD === */
             /* Layer 1: hidden = input @ W1^T + b1 */
             t_phase = HAP_perf_get_time_us();
+#ifdef USE_HMX
+            hmx_matmul_dispatch(g_vtcm_base, g_vtcm_size,
+                hidden, input, w1, bs, NET_HIDDEN_DIM, NET_INPUT_DIM_PAD, 1, 0);
+#else
             matmul_nt(hidden, input, w1, bs, NET_HIDDEN_DIM, NET_INPUT_DIM_PAD);
+#endif
             ctx->time_fwd_mm += (HAP_perf_get_time_us() - t_phase);
 
             t_phase = HAP_perf_get_time_us();
@@ -150,7 +183,12 @@ static void packet_callback(dspqueue_t queue, int error, void *context) {
 
             /* Layer 2: logits = hidden @ W2^T + b2 */
             t_phase = HAP_perf_get_time_us();
+#ifdef USE_HMX
+            hmx_matmul_dispatch(g_vtcm_base, g_vtcm_size,
+                logits, hidden, w2, bs, NET_OUTPUT_DIM_PAD, NET_HIDDEN_DIM, 1, 0);
+#else
             matmul_nt(logits, hidden, w2, bs, NET_OUTPUT_DIM_PAD, NET_HIDDEN_DIM);
+#endif
             ctx->time_fwd_mm += (HAP_perf_get_time_us() - t_phase);
 
             t_phase = HAP_perf_get_time_us();
@@ -180,8 +218,14 @@ static void packet_callback(dspqueue_t queue, int error, void *context) {
 
             /* dW2 = dlogits^T @ hidden (NOT accumulating) */
             t_phase = HAP_perf_get_time_us();
+#ifdef USE_HMX
+            memset(dw2, 0, NET_OUTPUT_DIM_PAD * NET_HIDDEN_DIM * sizeof(float));
+            hmx_matmul_dispatch(g_vtcm_base, g_vtcm_size,
+                dw2, dlogits, hidden, NET_OUTPUT_DIM_PAD, NET_HIDDEN_DIM, bs, 2, 0);
+#else
             matmul_tn(dw2, dlogits, hidden,
                       NET_OUTPUT_DIM_PAD, NET_HIDDEN_DIM, bs);
+#endif
             ctx->time_bwd_mm += (HAP_perf_get_time_us() - t_phase);
 
             /* db2 = sum_rows(dlogits) */
@@ -192,8 +236,13 @@ static void packet_callback(dspqueue_t queue, int error, void *context) {
 
             /* dhidden = dlogits @ W2 */
             t_phase = HAP_perf_get_time_us();
+#ifdef USE_HMX
+            hmx_matmul_dispatch(g_vtcm_base, g_vtcm_size,
+                dhidden, dlogits, w2, bs, NET_HIDDEN_DIM, NET_OUTPUT_DIM_PAD, 0, 0);
+#else
             matmul_nn(dhidden, dlogits, w2,
                       bs, NET_HIDDEN_DIM, NET_OUTPUT_DIM_PAD);
+#endif
             ctx->time_bwd_mm += (HAP_perf_get_time_us() - t_phase);
 
             /* ReLU backward */
@@ -203,8 +252,14 @@ static void packet_callback(dspqueue_t queue, int error, void *context) {
 
             /* dW1 = dhidden^T @ input (NOT accumulating) */
             t_phase = HAP_perf_get_time_us();
+#ifdef USE_HMX
+            memset(dw1, 0, NET_HIDDEN_DIM * NET_INPUT_DIM_PAD * sizeof(float));
+            hmx_matmul_dispatch(g_vtcm_base, g_vtcm_size,
+                dw1, dhidden, input, NET_HIDDEN_DIM, NET_INPUT_DIM_PAD, bs, 2, 0);
+#else
             matmul_tn(dw1, dhidden, input,
                       NET_HIDDEN_DIM, NET_INPUT_DIM_PAD, bs);
+#endif
             ctx->time_bwd_mm += (HAP_perf_get_time_us() - t_phase);
 
             /* db1 = sum_rows(dhidden) */
@@ -402,6 +457,7 @@ AEEResult mnist_train_start(remote_handle64 handle, uint64 dsp_queue_id) {
         FARF(ERROR, "dspqueue_import failed: 0x%08x", (unsigned)err);
         return err;
     }
+
     return AEE_SUCCESS;
 }
 

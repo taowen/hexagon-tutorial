@@ -79,24 +79,25 @@ Q6_R_dmwait();                                          // DMA 早就搬完了
 
 ---
 
-## 第五章：HexKL 矩阵乘法
+## 第五章：HMX 矩阵乘法
 
-**目录**: [`ch05-hexkl-matmul/`](ch05-hexkl-matmul/)
+**目录**: [`ch05-hmx/`](ch05-hmx/)
 
-用 HexKL（Hexagon Kernel Library）从底层搭建 HMX 矩阵乘法。对比三个 API 层级：SDKL（ARM 侧一行调用）、Micro（DSP 侧 tile 控制）、HVX+HMX 组合流水线。理解 weight layout 转换和 tile 调度的细节。
+从 tile 基础到生产级优化。4 个实验逐步深入：tile 手动操作 → 权重布局优化（L0→L1→L2 逐级加速）→ VTCM 流式处理 LLM 级大矩阵 → hexkl vs 直接 ASM 的完整管线对比。理解 weight layout 转换、chunk 分块策略和瓶颈图谱。
 
 ```c
-// HVX 反量化流水线：int8 → int16 → f16 → 乘以 scale（LLM 推理的核心模式）
-HVX_VectorPair wp = Q6_Wh_vunpack_Vb(v_i8);                  // int8 → int16
-HVX_Vector v_f16 = Q6_Vhf_equals_Vh(Q6_V_lo_W(wp));          // int16 → f16
-HVX_Vector v_prod = Q6_Vhf_equals_Vqf16(
-    Q6_Vqf16_vmpy_VhfVhf(v_f16, v_scale));                   // f16 × scale
+// hexkl_micro 手动 tile 操作：DDR→VTCM→AH/WH 格式→HMX 计算→回写
+hexkl_micro_hmx_rm_to_ah_f16(vtcm, act_off, A, row, k, M, K);  // 激活→AH 格式
+hexkl_micro_hmx_rm_to_wh_f16(vtcm, wt_off, W, k, col, K, N);   // 权重→WH 格式
+hexkl_micro_hmx_acc_clear_f16(vtcm, &cfg);                       // 清零累加器
+hexkl_micro_hmx_mm_f16(vtcm, act_off, wt_off, &cfg);            // tile 乘法
 ```
-```c
-// SDKL 一行调用 vs 手动 layout 转换 —— 166 倍加速
-sdkl_npu_mm_f32f16_f32(CDSP, N, M, K, A, X, W);              // 自动模式
-sdkl_cpu_rm_to_wh_f16_inplace(M, K, W2);                     // 手动：预转换 weight layout
-sdkl_npu_mm_f16(CDSP, N, M, K, A2, X2, W2);                  // 手动：直接用转好的 layout
+```
+// 瓶颈图谱：DDR I/O → VTCM → hexkl API → 纯 HMX，跨越三个数量级
+Exp 2 L0 (full DDR path):           ~1200 us    DDR I/O 占 99.5%
+Exp 4 Method A (VTCM, cache hot):     ~6 us    HMX compute 占 84%
+Exp 4 Method C (batch ASM):            ~3 us    ASM 批量加载优化
+Exp 4 compute only:                    ~1 us    纯 HMX 吞吐 28,000 GFLOPS
 ```
 
 ---

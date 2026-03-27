@@ -152,4 +152,18 @@ static void hvx_sgd_update(float *w, const float *grad, float lr, uint32_t n) {
         w[i] -= lr * grad[i];
 }
 
+/* f32 -> f16 conversion (scalar, used by HMX path)
+ * Note: Q6_Vhf_vcvt_VsfVsf is v79+ only, and Q6_Vhf_equals_Wqf32
+ * produces incorrect element ordering on v75. Scalar fallback is correct. */
+static void hvx_f32_to_f16(_Float16 *dst, const float *src, uint32_t n) {
+    for (uint32_t i = 0; i < n; i++)
+        dst[i] = (_Float16)src[i];
+}
+
+/* f16 -> f32 conversion (scalar, used by HMX path) */
+static void hvx_f16_to_f32(float *dst, const _Float16 *src, uint32_t n) {
+    for (uint32_t i = 0; i < n; i++)
+        dst[i] = (float)src[i];
+}
+
 #endif /* HVX_OPS_H */

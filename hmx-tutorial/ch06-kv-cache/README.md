@@ -21,7 +21,7 @@ ch09-kv-cache/
 需要第五章的 HexKL addon（`tools/hexkl-addon/`）。如未安装：
 
 ```bash
-cd ../ch05-hexkl-matmul && bash install_hexkl.sh
+cd ../ch05-hmx && bash install_hexkl.sh
 ```
 
 ## 构建和运行

@@ -22,6 +22,7 @@ SRC="$SCRIPT_DIR/src"
 BUILD="$SCRIPT_DIR/build"
 
 SDK="$ROOT_DIR/tools/hexagon-sdk"
+HEXKL="$ROOT_DIR/tools/hexkl-addon"
 ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-${HOME}/android-sdk/ndk/27.2.12479018}"
 HCC="$SDK/tools/HEXAGON_Tools/19.0.04/Tools/bin/hexagon-clang"
 QAIC="$SDK/ipc/fastrpc/qaic/Ubuntu/qaic"
@@ -180,18 +181,58 @@ echo "  -> $BUILD/skel_dspqueue.so"
     -o "$BUILD/skel_fused.so"
 echo "  -> $BUILD/skel_fused.so"
 
+# ========================================
+# Step 8c: Build skel_fused_hmx.so (fused training with HMX matmul)
+# ========================================
+echo "  Building skel_fused_hmx.so (HMX accelerated) ..."
+"$HCC" "${DSP_FLAGS[@]}" -mhmx -DUSE_HMX \
+    "${DSP_INCS[@]}" -I "$HEXKL/include" \
+    -c "$SRC/dsp/skel_fused.c" -o "$BUILD/skel_fused_hmx.obj"
+"$HCC" -mv75 -shared -Wl,-Bsymbolic \
+    "$BUILD/skel_fused_hmx.obj" "$BUILD/mnist_train_skel.obj" \
+    -Wl,--start-group "$HEXKL/lib/hexagon_toolv19_v75/libhexkl_micro.a" -Wl,--end-group \
+    -o "$BUILD/skel_fused_hmx.so"
+echo "  -> $BUILD/skel_fused_hmx.so"
+
+# ========================================
+# Step 8d: Build skel_fused_f16.so (fused f16 training with HMX)
+# ========================================
+echo "  Building skel_fused_f16.so (HMX f16) ..."
+"$HCC" "${DSP_FLAGS[@]}" -mhmx -DUSE_HMX \
+    "${DSP_INCS[@]}" -I "$HEXKL/include" \
+    -c "$SRC/dsp/skel_fused_f16.c" -o "$BUILD/skel_fused_f16.obj"
+"$HCC" -mv75 -shared -Wl,-Bsymbolic \
+    "$BUILD/skel_fused_f16.obj" "$BUILD/mnist_train_skel.obj" \
+    -Wl,--start-group "$HEXKL/lib/hexagon_toolv19_v75/libhexkl_micro.a" -Wl,--end-group \
+    -o "$BUILD/skel_fused_f16.so"
+echo "  -> $BUILD/skel_fused_f16.so"
+
+# ========================================
+# Step 9: Build train_fused_f16 (ARM)
+# ========================================
+echo "  Building train_fused_f16 ..."
+"$NDK_CC" -O2 \
+    "${ARM_INCS[@]}" \
+    "$SRC/arm/train_fused_f16.c" \
+    "${ARM_LIBS[@]}" \
+    -o "$BUILD/train_fused_f16"
+echo "  -> $BUILD/train_fused_f16"
+
 echo ""
 echo "========================================"
 echo "  Build complete!"
 echo "========================================"
 echo ""
 echo "Artifacts:"
-echo "  train_cpu:        $BUILD/train_cpu"
-echo "  train_fastrpc:    $BUILD/train_fastrpc"
-echo "  train_dspqueue:   $BUILD/train_dspqueue"
-echo "  train_fused:      $BUILD/train_fused"
-echo "  skel_fastrpc.so:  $BUILD/skel_fastrpc.so"
-echo "  skel_dspqueue.so: $BUILD/skel_dspqueue.so"
-echo "  skel_fused.so:    $BUILD/skel_fused.so"
+echo "  train_cpu:           $BUILD/train_cpu"
+echo "  train_fastrpc:       $BUILD/train_fastrpc"
+echo "  train_dspqueue:      $BUILD/train_dspqueue"
+echo "  train_fused:         $BUILD/train_fused"
+echo "  train_fused_f16:     $BUILD/train_fused_f16     (HMX f16)"
+echo "  skel_fastrpc.so:     $BUILD/skel_fastrpc.so"
+echo "  skel_dspqueue.so:    $BUILD/skel_dspqueue.so"
+echo "  skel_fused.so:       $BUILD/skel_fused.so"
+echo "  skel_fused_hmx.so:   $BUILD/skel_fused_hmx.so  (HMX accelerated)"
+echo "  skel_fused_f16.so:   $BUILD/skel_fused_f16.so  (HMX f16)"
 echo ""
 echo "Next: bash $(dirname "$0")/run_device.sh"
