@@ -137,7 +137,7 @@ static void arm_packet_callback(dspqueue_t queue, AEEResult error, void *context
             return;
         }
 
-        if (rsp.matmul.op == OP_TRAIN_BATCH || rsp.matmul.op == OP_EVAL) {
+        if (rsp.matmul.op == OP_TRAIN_BATCH) {
             ctx->last_loss = rsp.train.loss;
             ctx->last_correct = rsp.train.correct;
         }
@@ -297,68 +297,6 @@ static void dspqueue_sync(network_t *net) {
     dspqueue_write(g_dspq.queue, 0, 4, bufs,
                    sizeof(req), (const uint8_t *)&req, 1000000);
     sem_wait(&g_dspq.done_sem);
-}
-
-/*
- * Zero-copy dspqueue matmul dispatch
- *
- * All network buffers (weights, activations, gradients) are in shared memory.
- * We look up their fds and pass them directly to dspqueue - no memcpy needed!
- */
-static void dspqueue_matmul_dispatch(float *C, const float *A, const float *B,
-                                     int m, int n, int k, int transpose) {
-    /* Look up fds for all three buffers */
-    int fd_a = dspq_find_fd(A);
-    int fd_b = dspq_find_fd(B);
-    int fd_c = dspq_find_fd(C);
-
-    if (fd_a < 0 || fd_b < 0 || fd_c < 0) {
-        fprintf(stderr, "[ERROR] buffer not in shared memory: A=%d B=%d C=%d\n",
-                fd_a, fd_b, fd_c);
-        return;
-    }
-
-    /* Build request */
-    struct matmul_req req;
-    memset(&req, 0, sizeof(req));
-    req.op = OP_MATMUL;
-    req.m = (uint32_t)m;
-    req.n = (uint32_t)n;
-    req.k = (uint32_t)k;
-    req.transpose = (uint32_t)transpose;
-    req.accumulate = (transpose == 2) ? 1 : 0;
-
-    /* Set up buffer references -- zero copy! */
-    struct dspqueue_buffer dbufs[3];
-    memset(dbufs, 0, sizeof(dbufs));
-
-    dbufs[0].fd = fd_a;
-    dbufs[0].flags = DSPQUEUE_BUFFER_FLAG_REF
-                   | DSPQUEUE_BUFFER_FLAG_FLUSH_SENDER
-                   | DSPQUEUE_BUFFER_FLAG_INVALIDATE_RECIPIENT;
-    dbufs[1].fd = fd_b;
-    dbufs[1].flags = DSPQUEUE_BUFFER_FLAG_REF
-                   | DSPQUEUE_BUFFER_FLAG_FLUSH_SENDER
-                   | DSPQUEUE_BUFFER_FLAG_INVALIDATE_RECIPIENT;
-    dbufs[2].fd = fd_c;
-    dbufs[2].flags = DSPQUEUE_BUFFER_FLAG_REF
-                   | DSPQUEUE_BUFFER_FLAG_FLUSH_SENDER
-                   | DSPQUEUE_BUFFER_FLAG_INVALIDATE_RECIPIENT;
-
-    /* Send and wait synchronously */
-    g_dspq.ops_done = 0;
-    g_dspq.ops_total = 1;
-
-    int err = dspqueue_write(g_dspq.queue, 0, 3, dbufs,
-                              sizeof(req), (const uint8_t *)&req,
-                              1000000);
-    if (err != 0) {
-        fprintf(stderr, "[ERROR] dspqueue_write failed: 0x%08x\n", (unsigned)err);
-        return;
-    }
-
-    sem_wait(&g_dspq.done_sem);
-    /* No memcpy needed! Result is already in shared memory buffer C */
 }
 
 #endif /* DSPQUEUE_MGR_H */

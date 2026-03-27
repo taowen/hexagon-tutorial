@@ -1,22 +1,20 @@
 #!/usr/bin/env bash
 #
-# run_device.sh -- Run MNIST training on device (4-step experiment)
+# run_device.sh -- Run MNIST training on device
 #
-# Runs all 4 steps in sequence:
-#   step1_cpu      -- CPU baseline (no DSP)
-#   step2_fastrpc  -- FastRPC matmul offload (5 kernel transitions per batch)
-#   step3_dspqueue -- dspqueue matmul offload (5 userspace calls per batch)
-#   step4_fused    -- dspqueue fused training (1 call per batch)
+# Runs CPU baseline and HVX fused dspqueue training:
+#   train_cpu    -- CPU baseline (no DSP)
+#   train_fused  -- dspqueue fused HVX f32 training (1 call per batch)
 #
 # Usage:
-#   ./run_device.sh              # Run all steps, 5 epochs, batch=32
-#   ./run_device.sh 3 128        # Run all steps, 3 epochs, batch=128
+#   ./run_device.sh              # Run all, 5 epochs, batch=32
+#   ./run_device.sh 3 128        # 3 epochs, batch=128
 #
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BUILD_DIR="$SCRIPT_DIR/build"
-DEVICE_DIR="/data/local/tmp/ch12"
+DEVICE_DIR="/data/local/tmp/ch08"
 
 EPOCHS="${1:-5}"
 BATCH_SIZE="${2:-32}"
@@ -43,81 +41,49 @@ echo "=== Pushing files to device ==="
 adb shell "mkdir -p $DEVICE_DIR"
 adb push "$DATA_DIR"/* "$DEVICE_DIR/"
 
-# Push step binaries
-for step in step1_cpu step2_fastrpc step3_dspqueue step4_fused; do
-    if [ -f "$BUILD_DIR/$step" ]; then
-        adb push "$BUILD_DIR/$step" "$DEVICE_DIR/"
-        adb shell "chmod +x $DEVICE_DIR/$step"
+# Push binaries
+for bin in train_cpu train_fused; do
+    if [ -f "$BUILD_DIR/$bin" ]; then
+        adb push "$BUILD_DIR/$bin" "$DEVICE_DIR/"
+        adb shell "chmod +x $DEVICE_DIR/$bin"
     fi
 done
 
-# Push DSP skel .so files (each step gets its own)
-for skel in step2_skel.so step3_skel.so step4_skel.so; do
-    if [ -f "$BUILD_DIR/$skel" ]; then
-        adb push "$BUILD_DIR/$skel" "$DEVICE_DIR/"
-    fi
-done
+# Push DSP skel
+if [ -f "$BUILD_DIR/skel_fused.so" ]; then
+    adb push "$BUILD_DIR/skel_fused.so" "$DEVICE_DIR/"
+fi
 
 echo ""
 
 # ---- DSP environment ----
 DSP_ENV="LD_LIBRARY_PATH=$DEVICE_DIR ADSP_LIBRARY_PATH=$DEVICE_DIR"
 
-# ---- Step 1: CPU baseline ----
-if [ -f "$BUILD_DIR/step1_cpu" ]; then
+# ---- CPU baseline ----
+if [ -f "$BUILD_DIR/train_cpu" ]; then
     echo "============================================"
-    echo "  Step 1: CPU Baseline (f32 scalar matmul)"
+    echo "  CPU Baseline (f32 scalar matmul)"
     echo "============================================"
-    adb shell "cd $DEVICE_DIR && ./step1_cpu $EPOCHS $BATCH_SIZE"
+    adb shell "cd $DEVICE_DIR && ./train_cpu $EPOCHS $BATCH_SIZE"
     echo ""
     echo "--------------------------------------------"
     echo ""
 else
-    echo "[SKIP] step1_cpu not built"
+    echo "[SKIP] train_cpu not built"
 fi
 
-# ---- Step 2: FastRPC matmul offload ----
-if [ -f "$BUILD_DIR/step2_fastrpc" ] && [ -f "$BUILD_DIR/step2_skel.so" ]; then
+# ---- HVX fused dspqueue training ----
+if [ -f "$BUILD_DIR/train_fused" ] && [ -f "$BUILD_DIR/skel_fused.so" ]; then
     echo "============================================"
-    echo "  Step 2: FastRPC Matmul Offload"
+    echo "  HVX Fused Training (dspqueue, 1 call/batch)"
     echo "============================================"
-    adb push "$BUILD_DIR/step2_skel.so" "$DEVICE_DIR/libmnist_train_skel.so"
-    adb shell "cd $DEVICE_DIR && $DSP_ENV ./step2_fastrpc $EPOCHS $BATCH_SIZE"
-    echo ""
-    echo "--------------------------------------------"
+    adb push "$BUILD_DIR/skel_fused.so" "$DEVICE_DIR/libmnist_train_skel.so"
+    adb shell "cd $DEVICE_DIR && $DSP_ENV ./train_fused $EPOCHS $BATCH_SIZE"
     echo ""
 else
-    echo "[SKIP] step2_fastrpc not built (needs Hexagon SDK)"
-fi
-
-# ---- Step 3: dspqueue matmul offload ----
-if [ -f "$BUILD_DIR/step3_dspqueue" ] && [ -f "$BUILD_DIR/step3_skel.so" ]; then
-    echo "============================================"
-    echo "  Step 3: dspqueue Matmul Offload"
-    echo "============================================"
-    adb push "$BUILD_DIR/step3_skel.so" "$DEVICE_DIR/libmnist_train_skel.so"
-    adb shell "cd $DEVICE_DIR && $DSP_ENV ./step3_dspqueue $EPOCHS $BATCH_SIZE"
-    echo ""
-    echo "--------------------------------------------"
-    echo ""
-else
-    echo "[SKIP] step3_dspqueue not built (needs Hexagon SDK)"
-fi
-
-# ---- Step 4: dspqueue fused training ----
-if [ -f "$BUILD_DIR/step4_fused" ] && [ -f "$BUILD_DIR/step4_skel.so" ]; then
-    echo "============================================"
-    echo "  Step 4: dspqueue Fused Training"
-    echo "============================================"
-    adb push "$BUILD_DIR/step4_skel.so" "$DEVICE_DIR/libmnist_train_skel.so"
-    adb shell "cd $DEVICE_DIR && $DSP_ENV ./step4_fused $EPOCHS $BATCH_SIZE"
-    echo ""
-else
-    echo "[SKIP] step4_fused not built (needs Hexagon SDK)"
+    echo "[SKIP] train_fused not built (needs Hexagon SDK)"
 fi
 
 echo "============================================"
 echo "  All steps complete!"
-echo "  Compare timing across steps to see the"
-echo "  effect of each optimization."
 echo "============================================"

@@ -1,14 +1,15 @@
 /*
- * Step 4: Entire training loop runs on DSP. ARM sends 1 message per batch.
+ * skel_fused.c -- Fused training on DSP (HVX f32)
+ *
+ * Entire forward + backward + SGD runs on DSP per batch.
+ * ARM sends 1 message per batch via dspqueue.
  *
  * Handles OP_REGISTER_NET, OP_TRAIN_BATCH, OP_SYNC.
- * Does NOT handle OP_MATMUL since the fused path doesn't use it.
  */
 
 #include "dsp/skel_common.h"
 #include "dsp/hvx_matmul.h"
 #include "dsp/hvx_ops.h"
-#include "dsp/hmx_matmul.h"
 #include "common/protocol.h"
 
 /* ---------- DSP context ---------- */
@@ -24,9 +25,6 @@ struct mnist_context {
     float   *net_bufs[NET_BUF_COUNT];
     int      net_fds[NET_BUF_COUNT];
     int      net_registered;
-#ifdef USE_HMX
-    int      hmx_initialized;
-#endif
 };
 
 
@@ -53,11 +51,9 @@ static void packet_callback(dspqueue_t queue, int error, void *context) {
     while (1) {
         /* Read with largest possible message buffer */
         union {
-            struct matmul_req matmul;
             struct register_net_req reg;
             struct train_batch_req train;
             struct sync_req sync;
-            struct test_op_req test;
         } msg;
         uint32_t flags, msg_len, n_bufs;
         struct dspqueue_buffer bufs[MATMUL_MAX_BUFFERS];
@@ -73,54 +69,7 @@ static void packet_callback(dspqueue_t queue, int error, void *context) {
 
         uint32_t op = msg.reg.op;  /* op is always first field */
 
-#ifdef USE_HMX
-        /* Lazy HMX init in callback thread (HMX lock is thread-local) */
-        if (!ctx->hmx_initialized) {
-            int hmx_err = hexkl_micro_hw_init(&g_vtcm_base, &g_vtcm_size);
-            if (hmx_err == AEE_SUCCESS) {
-                hmx_err = hexkl_micro_hmx_lock();
-            }
-            if (hmx_err == AEE_SUCCESS) {
-                ctx->hmx_initialized = 1;
-                FARF(HIGH, "HMX initialized in callback: VTCM %u KB", g_vtcm_size / 1024);
-            } else {
-                FARF(ERROR, "HMX init failed: 0x%08x", (unsigned)hmx_err);
-            }
-        }
-#endif
-
-        if (op == OP_MATMUL && n_bufs >= 3) {
-            struct matmul_req *mreq = (struct matmul_req *)&msg;
-#ifdef USE_HMX
-            hmx_matmul_dispatch(g_vtcm_base, g_vtcm_size,
-                (float *)bufs[2].ptr,
-                (const float *)bufs[0].ptr,
-                (const float *)bufs[1].ptr,
-                mreq->m, mreq->n, mreq->k,
-                mreq->transpose, mreq->accumulate);
-#else
-            do_matmul((float *)bufs[2].ptr,
-                      (const float *)bufs[0].ptr,
-                      (const float *)bufs[1].ptr,
-                      mreq->m, mreq->n, mreq->k,
-                      mreq->transpose, mreq->accumulate);
-#endif
-            struct dspqueue_buffer rsp_bufs[3];
-            memset(rsp_bufs, 0, sizeof(rsp_bufs));
-            rsp_bufs[0].fd = bufs[0].fd;
-            rsp_bufs[0].flags = DSPQUEUE_BUFFER_FLAG_DEREF;
-            rsp_bufs[1].fd = bufs[1].fd;
-            rsp_bufs[1].flags = DSPQUEUE_BUFFER_FLAG_DEREF;
-            rsp_bufs[2].fd = bufs[2].fd;
-            rsp_bufs[2].flags = DSPQUEUE_BUFFER_FLAG_DEREF
-                              | DSPQUEUE_BUFFER_FLAG_FLUSH_SENDER
-                              | DSPQUEUE_BUFFER_FLAG_INVALIDATE_RECIPIENT;
-            struct matmul_rsp rsp = { OP_MATMUL, 0 };
-            dspqueue_write(queue, 0, 3, rsp_bufs,
-                           sizeof(rsp), (const uint8_t *)&rsp,
-                           DSPQUEUE_TIMEOUT_NONE);
-
-        } else if (op == OP_REGISTER_NET && n_bufs >= NET_BUF_COUNT) {
+        if (op == OP_REGISTER_NET && n_bufs >= NET_BUF_COUNT) {
             /* Store buffer pointers and fds */
             for (int i = 0; i < NET_BUF_COUNT; i++) {
                 ctx->net_bufs[i] = (float *)bufs[i].ptr;
@@ -167,12 +116,7 @@ static void packet_callback(dspqueue_t queue, int error, void *context) {
             /* === FORWARD === */
             /* Layer 1: hidden = input @ W1^T + b1 */
             t_phase = HAP_perf_get_time_us();
-#ifdef USE_HMX
-            hmx_matmul_dispatch(g_vtcm_base, g_vtcm_size,
-                hidden, input, w1, bs, NET_HIDDEN_DIM, NET_INPUT_DIM_PAD, 1, 0);
-#else
             matmul_nt(hidden, input, w1, bs, NET_HIDDEN_DIM, NET_INPUT_DIM_PAD);
-#endif
             ctx->time_fwd_mm += (HAP_perf_get_time_us() - t_phase);
 
             t_phase = HAP_perf_get_time_us();
@@ -183,12 +127,7 @@ static void packet_callback(dspqueue_t queue, int error, void *context) {
 
             /* Layer 2: logits = hidden @ W2^T + b2 */
             t_phase = HAP_perf_get_time_us();
-#ifdef USE_HMX
-            hmx_matmul_dispatch(g_vtcm_base, g_vtcm_size,
-                logits, hidden, w2, bs, NET_OUTPUT_DIM_PAD, NET_HIDDEN_DIM, 1, 0);
-#else
             matmul_nt(logits, hidden, w2, bs, NET_OUTPUT_DIM_PAD, NET_HIDDEN_DIM);
-#endif
             ctx->time_fwd_mm += (HAP_perf_get_time_us() - t_phase);
 
             t_phase = HAP_perf_get_time_us();
@@ -216,16 +155,10 @@ static void packet_callback(dspqueue_t queue, int error, void *context) {
             hvx_compute_dlogits(dlogits, probs, treq->labels, bs);
             ctx->time_bwd_other += (HAP_perf_get_time_us() - t_phase);
 
-            /* dW2 = dlogits^T @ hidden (NOT accumulating) */
+            /* dW2 = dlogits^T @ hidden */
             t_phase = HAP_perf_get_time_us();
-#ifdef USE_HMX
-            memset(dw2, 0, NET_OUTPUT_DIM_PAD * NET_HIDDEN_DIM * sizeof(float));
-            hmx_matmul_dispatch(g_vtcm_base, g_vtcm_size,
-                dw2, dlogits, hidden, NET_OUTPUT_DIM_PAD, NET_HIDDEN_DIM, bs, 2, 0);
-#else
             matmul_tn(dw2, dlogits, hidden,
                       NET_OUTPUT_DIM_PAD, NET_HIDDEN_DIM, bs);
-#endif
             ctx->time_bwd_mm += (HAP_perf_get_time_us() - t_phase);
 
             /* db2 = sum_rows(dlogits) */
@@ -236,13 +169,8 @@ static void packet_callback(dspqueue_t queue, int error, void *context) {
 
             /* dhidden = dlogits @ W2 */
             t_phase = HAP_perf_get_time_us();
-#ifdef USE_HMX
-            hmx_matmul_dispatch(g_vtcm_base, g_vtcm_size,
-                dhidden, dlogits, w2, bs, NET_HIDDEN_DIM, NET_OUTPUT_DIM_PAD, 0, 0);
-#else
             matmul_nn(dhidden, dlogits, w2,
                       bs, NET_HIDDEN_DIM, NET_OUTPUT_DIM_PAD);
-#endif
             ctx->time_bwd_mm += (HAP_perf_get_time_us() - t_phase);
 
             /* ReLU backward */
@@ -250,16 +178,10 @@ static void packet_callback(dspqueue_t queue, int error, void *context) {
             hvx_relu_backward(dhidden, hidden_pre, bs * NET_HIDDEN_DIM);
             ctx->time_bwd_other += (HAP_perf_get_time_us() - t_phase);
 
-            /* dW1 = dhidden^T @ input (NOT accumulating) */
+            /* dW1 = dhidden^T @ input */
             t_phase = HAP_perf_get_time_us();
-#ifdef USE_HMX
-            memset(dw1, 0, NET_HIDDEN_DIM * NET_INPUT_DIM_PAD * sizeof(float));
-            hmx_matmul_dispatch(g_vtcm_base, g_vtcm_size,
-                dw1, dhidden, input, NET_HIDDEN_DIM, NET_INPUT_DIM_PAD, bs, 2, 0);
-#else
             matmul_tn(dw1, dhidden, input,
                       NET_HIDDEN_DIM, NET_INPUT_DIM_PAD, bs);
-#endif
             ctx->time_bwd_mm += (HAP_perf_get_time_us() - t_phase);
 
             /* db1 = sum_rows(dhidden) */
@@ -311,119 +233,6 @@ static void packet_callback(dspqueue_t queue, int error, void *context) {
             dspqueue_write(queue, 0, 4, rsp_bufs,
                            sizeof(rsp), (const uint8_t *)&rsp,
                            DSPQUEUE_TIMEOUT_NONE);
-
-        } else if (op == OP_TEST_RELU_FWD && n_bufs >= 1) {
-            float *x = (float *)bufs[0].ptr;
-            uint32_t n = msg.test.param1;
-            hvx_relu_forward(x, n);
-            struct dspqueue_buffer rsp_bufs[1];
-            memset(rsp_bufs, 0, sizeof(rsp_bufs));
-            rsp_bufs[0].fd = bufs[0].fd;
-            rsp_bufs[0].flags = DSPQUEUE_BUFFER_FLAG_DEREF
-                              | DSPQUEUE_BUFFER_FLAG_FLUSH_SENDER
-                              | DSPQUEUE_BUFFER_FLAG_INVALIDATE_RECIPIENT;
-            struct matmul_rsp rsp = { op, 0 };
-            dspqueue_write(queue, 0, 1, rsp_bufs, sizeof(rsp), (const uint8_t *)&rsp, DSPQUEUE_TIMEOUT_NONE);
-
-        } else if (op == OP_TEST_RELU_BWD && n_bufs >= 2) {
-            float *dx = (float *)bufs[0].ptr;
-            const float *pre_relu = (const float *)bufs[1].ptr;
-            uint32_t n = msg.test.param1;
-            hvx_relu_backward(dx, pre_relu, n);
-            struct dspqueue_buffer rsp_bufs[2];
-            memset(rsp_bufs, 0, sizeof(rsp_bufs));
-            rsp_bufs[0].fd = bufs[0].fd;
-            rsp_bufs[0].flags = DSPQUEUE_BUFFER_FLAG_DEREF
-                              | DSPQUEUE_BUFFER_FLAG_FLUSH_SENDER
-                              | DSPQUEUE_BUFFER_FLAG_INVALIDATE_RECIPIENT;
-            rsp_bufs[1].fd = bufs[1].fd;
-            rsp_bufs[1].flags = DSPQUEUE_BUFFER_FLAG_DEREF;
-            struct matmul_rsp rsp = { op, 0 };
-            dspqueue_write(queue, 0, 2, rsp_bufs, sizeof(rsp), (const uint8_t *)&rsp, DSPQUEUE_TIMEOUT_NONE);
-
-        } else if (op == OP_TEST_BIAS_BWD && n_bufs >= 2) {
-            const float *dout = (const float *)bufs[0].ptr;
-            float *db = (float *)bufs[1].ptr;
-            uint32_t batch = msg.test.param1;
-            uint32_t dim = msg.test.param2;
-            hvx_bias_backward(db, dout, batch, dim);
-            struct dspqueue_buffer rsp_bufs[2];
-            memset(rsp_bufs, 0, sizeof(rsp_bufs));
-            rsp_bufs[0].fd = bufs[0].fd;
-            rsp_bufs[0].flags = DSPQUEUE_BUFFER_FLAG_DEREF;
-            rsp_bufs[1].fd = bufs[1].fd;
-            rsp_bufs[1].flags = DSPQUEUE_BUFFER_FLAG_DEREF
-                              | DSPQUEUE_BUFFER_FLAG_FLUSH_SENDER
-                              | DSPQUEUE_BUFFER_FLAG_INVALIDATE_RECIPIENT;
-            struct matmul_rsp rsp = { op, 0 };
-            dspqueue_write(queue, 0, 2, rsp_bufs, sizeof(rsp), (const uint8_t *)&rsp, DSPQUEUE_TIMEOUT_NONE);
-
-        } else if (op == OP_TEST_ADD_BIAS && n_bufs >= 2) {
-            float *out = (float *)bufs[0].ptr;
-            const float *bias = (const float *)bufs[1].ptr;
-            uint32_t batch = msg.test.param1;
-            uint32_t dim = msg.test.param2;
-            hvx_add_bias(out, bias, batch, dim);
-            struct dspqueue_buffer rsp_bufs[2];
-            memset(rsp_bufs, 0, sizeof(rsp_bufs));
-            rsp_bufs[0].fd = bufs[0].fd;
-            rsp_bufs[0].flags = DSPQUEUE_BUFFER_FLAG_DEREF
-                              | DSPQUEUE_BUFFER_FLAG_FLUSH_SENDER
-                              | DSPQUEUE_BUFFER_FLAG_INVALIDATE_RECIPIENT;
-            rsp_bufs[1].fd = bufs[1].fd;
-            rsp_bufs[1].flags = DSPQUEUE_BUFFER_FLAG_DEREF;
-            struct matmul_rsp rsp = { op, 0 };
-            dspqueue_write(queue, 0, 2, rsp_bufs, sizeof(rsp), (const uint8_t *)&rsp, DSPQUEUE_TIMEOUT_NONE);
-
-        } else if (op == OP_TEST_SOFTMAX_CE && n_bufs >= 2) {
-            const float *logits = (const float *)bufs[0].ptr;
-            float *probs = (float *)bufs[1].ptr;
-            uint32_t batch = msg.test.param1;
-            float loss = hvx_softmax_cross_entropy(logits, msg.test.labels, probs, batch);
-            struct dspqueue_buffer rsp_bufs[2];
-            memset(rsp_bufs, 0, sizeof(rsp_bufs));
-            rsp_bufs[0].fd = bufs[0].fd;
-            rsp_bufs[0].flags = DSPQUEUE_BUFFER_FLAG_DEREF;
-            rsp_bufs[1].fd = bufs[1].fd;
-            rsp_bufs[1].flags = DSPQUEUE_BUFFER_FLAG_DEREF
-                              | DSPQUEUE_BUFFER_FLAG_FLUSH_SENDER
-                              | DSPQUEUE_BUFFER_FLAG_INVALIDATE_RECIPIENT;
-            struct test_op_rsp rsp = { op, 0, loss, 0 };
-            dspqueue_write(queue, 0, 2, rsp_bufs, sizeof(rsp), (const uint8_t *)&rsp, DSPQUEUE_TIMEOUT_NONE);
-
-        } else if (op == OP_TEST_DLOGITS && n_bufs >= 2) {
-            float *dlogits = (float *)bufs[0].ptr;
-            const float *probs = (const float *)bufs[1].ptr;
-            uint32_t batch = msg.test.param1;
-            hvx_compute_dlogits(dlogits, probs, msg.test.labels, batch);
-            struct dspqueue_buffer rsp_bufs[2];
-            memset(rsp_bufs, 0, sizeof(rsp_bufs));
-            rsp_bufs[0].fd = bufs[0].fd;
-            rsp_bufs[0].flags = DSPQUEUE_BUFFER_FLAG_DEREF
-                              | DSPQUEUE_BUFFER_FLAG_FLUSH_SENDER
-                              | DSPQUEUE_BUFFER_FLAG_INVALIDATE_RECIPIENT;
-            rsp_bufs[1].fd = bufs[1].fd;
-            rsp_bufs[1].flags = DSPQUEUE_BUFFER_FLAG_DEREF;
-            struct matmul_rsp rsp = { op, 0 };
-            dspqueue_write(queue, 0, 2, rsp_bufs, sizeof(rsp), (const uint8_t *)&rsp, DSPQUEUE_TIMEOUT_NONE);
-
-        } else if (op == OP_TEST_SGD && n_bufs >= 2) {
-            float *w = (float *)bufs[0].ptr;
-            const float *grad = (const float *)bufs[1].ptr;
-            uint32_t n = msg.test.param1;
-            uint32_t lr_bits = msg.test.param2;
-            float lr = *(float *)&lr_bits;
-            hvx_sgd_update(w, grad, lr, n);
-            struct dspqueue_buffer rsp_bufs[2];
-            memset(rsp_bufs, 0, sizeof(rsp_bufs));
-            rsp_bufs[0].fd = bufs[0].fd;
-            rsp_bufs[0].flags = DSPQUEUE_BUFFER_FLAG_DEREF
-                              | DSPQUEUE_BUFFER_FLAG_FLUSH_SENDER
-                              | DSPQUEUE_BUFFER_FLAG_INVALIDATE_RECIPIENT;
-            rsp_bufs[1].fd = bufs[1].fd;
-            rsp_bufs[1].flags = DSPQUEUE_BUFFER_FLAG_DEREF;
-            struct matmul_rsp rsp = { op, 0 };
-            dspqueue_write(queue, 0, 2, rsp_bufs, sizeof(rsp), (const uint8_t *)&rsp, DSPQUEUE_TIMEOUT_NONE);
 
         } else {
             FARF(ERROR, "Unknown op %u or bad state (n_bufs=%u, registered=%d)",
@@ -477,7 +286,7 @@ AEEResult mnist_train_stop(remote_handle64 handle, uint64 *process_time) {
 }
 
 
-/* ========== Stub (not used by step 4) ========== */
+/* ========== Stub (not used by fused path) ========== */
 
 AEEResult mnist_train_do_matmul(remote_handle64 handle,
                                  const uint8 *a_buf, int a_buf_len,
