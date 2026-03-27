@@ -2,7 +2,7 @@
  * train_vtcm_dspq.c -- MNIST training with VTCM-resident weights (dspqueue)
  *
  * Based on ch08's train_fused.c, modified to evaluate on DSP side to prevent
- * VTCM corruption during DSP idle time. See ch10 README for analysis.
+ * VTCM corruption during DSP idle time. See ch04 README (Part 7: VTCM 抢占) for analysis.
  *
  * Key difference from ch08: evaluation uses OP_EVAL (forward pass on DSP using
  * VTCM weights) instead of OP_SYNC + ARM cpu_evaluate. This keeps the DSP busy

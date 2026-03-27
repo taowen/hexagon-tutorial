@@ -1,4 +1,4 @@
-# 第六章：VTCM 内存管理 — 从分配到 DMA 到流水线
+# 第四章：VTCM 内存管理 — 从分配到 DMA 到流水线
 
 前五章我们在 Hexagon DSP 上跑了 HVX 向量运算、HMX 矩阵乘、QNN 算子，还用 dspqueue 替代了 FastRPC。但有一个关键资源一直在幕后默默工作：**VTCM（Vector Tightly Coupled Memory）**。
 
@@ -22,7 +22,7 @@ VTCM 的核心价值：
 ## 源码结构
 
 ```
-ch06-vtcm-memory/
+ch04-vtcm-memory/
 ├── src/
 │   ├── common.h           # 共享声明：VTCM 全局变量、vtcm_seq_alloc()
 │   ├── demo_vtcm_alloc.c  # Part 1: VTCM 分配 + main() 入口
@@ -39,8 +39,8 @@ ch06-vtcm-memory/
 ## 构建与运行
 
 ```bash
-bash ch06-vtcm-memory/build.sh
-bash ch06-vtcm-memory/run_device.sh
+bash ch04-vtcm-memory/build.sh
+bash ch04-vtcm-memory/run_device.sh
 ```
 
 ## 实验内容
@@ -403,11 +403,45 @@ VTCM 8 MB
 
 每个 matmul op 开始时 bump allocator 重置指针，重新划分。不同大小的矩阵用不同的布局，但模式固定。
 
-### Part 7: QNN 的 VTCM 调度
+### Part 7: VTCM 抢占 — 为什么 VTCM 数据会"消失"
+
+在 ch09 的 VTCM 训练中，我们发现了一个关键陷阱：**训练数据放在 VTCM 中跨消息复用时，如果 DSP 空闲几秒钟，VTCM 中的权重会被随机覆盖。**
+
+#### 现象
+
+前几个 epoch 训练正常（96% 准确率），但在 epoch 间让 DSP 空闲（ARM 侧做 cpu_evaluate 约 3-5 秒）后，loss 突然飙升，准确率跌到随机水平（9.8%）。
+
+#### 决定性实验
+
+| 配置 | DSP 做什么 | ARM 做什么 | DSP 空闲? | 结果 |
+|------|-----------|-----------|-----------|------|
+| A: NOOP + eval | 什么都不做 | cpu_evaluate 数秒 | **是** | **Epoch 3 权重损坏** |
+| B: memcpy + busy | 400KB memcpy + 50次 dummy matmul | 什么都不做 | **否** | **5 epoch 全部正常** |
+
+配置 A 中 DSP 没有碰 VTCM 的任何数据，权重却被覆盖 — 证明是**外部写入**。配置 B 做了完整 memcpy 但保持 DSP 忙碌，VTCM 完好无损。
+
+#### 根因
+
+`HAP_compute_res_acquire` 获取的 VTCM 并非独占锁。在 Android 设备上，camera、audio、NN 服务等多个 DSP 客户端共享 VTCM。当我们的 DSP 线程空闲（阻塞在 dspqueue_read 等待消息）时，系统调度器可能将 VTCM 分配给其他高优先级客户端。
+
+```
+安全:  DSP 持续处理消息（<100ms 间隔）  ✅ VTCM 不被抢
+危险:  DSP 空闲数秒（ARM 做大量计算）   ❌ VTCM 被其他客户端覆盖
+```
+
+#### 解决方案
+
+1. **在 DSP 上做评估**（推荐）— 将测试数据发送到 DSP，用 VTCM 权重做推理，不让 DSP 空闲
+2. **DSP 侧 keepalive** — ARM 做计算期间给 DSP 发心跳消息保持活跃
+3. **接受限制** — 不在训练中途导出权重，只在结束后导出
+
+llama.cpp 和 htp-ops-lib 不受影响，因为它们的 DSP 线程始终忙碌（连续消息流）。
+
+### Part 8: QNN 的 VTCM 调度
 
 QNN 如何自动调度 VTCM？见第七章的实验。
 
-### Part 8: VTCM 共享 — 多进程协作
+### Part 9: VTCM 共享 — 多进程协作
 
 VTCM 共享和多图并行执行？见第七章的实验 3。
 
@@ -426,15 +460,14 @@ VTCM 共享和多图并行执行？见第七章的实验 3。
 
 QNN 的 VTCM 调度策略（编译器自动分配、spill/fill、VTCM 共享）见第七章。
 
-## 六章总结
+## 总结
 
 | 章节 | 主题 | 运行环境 | 关键收获 |
 |---|---|---|---|
 | ch01 | 模拟器 HVX/HMX | x86 模拟器 | Hexagon 基本架构 |
 | ch02 | 真机 HVX/HMX | CDSP (run_main) | HAP API, VTCM 分配 |
 | ch03 | QNN 自定义算子 | CDSP (QNN) | QNN 框架集成 |
-| ch04 | QNN 模拟器 | x86 (libnative) | x86 上调试 HVX/HMX |
+| **ch04** | **VTCM + DMA + 流水线** | **CDSP (run_main)** | **内存管理/DMA/HMX 流水线/VTCM 抢占** |
 | ch05 | dspqueue vs FastRPC | CDSP (dspqueue) | 通信开销, llama.cpp 架构 |
-| **ch06** | **VTCM + DMA + 流水线** | **CDSP (run_main)** | **内存管理/DMA/HMX 流水线** |
 
-下一章（ch07）将通过实际 QNN 实验探索 VTCM 自动调度和多进程共享。
+下一章（ch05）将通过 dspqueue 实验探索 ARM-DSP 通信优化。
