@@ -50,8 +50,8 @@ DSP_INCS=(
     -I "$SDK/incs"
     -I "$SDK/incs/stddef"
     -I "$SDK/rtos/qurt/computev75/include/qurt"
-    -I "$CH08_SRC"
     -I "$SRC"
+    -I "$CH08_SRC"
     -I "$CH08_BUILD"
     -I "$HEXKL/include"
 )
@@ -79,8 +79,8 @@ ARM_INCS=(
     -I "$SDK/incs"
     -I "$SDK/incs/stddef"
     -I "$SDK/ipc/fastrpc/rpcmem/inc"
-    -I "$CH08_SRC"
     -I "$SRC"
+    -I "$CH08_SRC"
     -I "$CH08_BUILD"
 )
 ARM_LIBS=(
