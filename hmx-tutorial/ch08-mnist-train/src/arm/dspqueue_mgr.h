@@ -137,7 +137,7 @@ static void arm_packet_callback(dspqueue_t queue, AEEResult error, void *context
             return;
         }
 
-        if (rsp.matmul.op == OP_TRAIN_BATCH) {
+        if (rsp.matmul.op == OP_TRAIN_BATCH || rsp.matmul.op == OP_EVAL) {
             ctx->last_loss = rsp.train.loss;
             ctx->last_correct = rsp.train.correct;
         }
