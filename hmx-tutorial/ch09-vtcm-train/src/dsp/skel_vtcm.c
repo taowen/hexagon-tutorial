@@ -92,8 +92,7 @@ struct mnist_context {
 
     /* VTCM f16 data buffers (bump-allocated from vtcm_base) */
     _Float16 *v_b1, *v_b2;                      /* biases           */
-    _Float16 *v_w1_t, *v_w2_t;                  /* transposed weights (primary) */
-    _Float16 *v_dw1_t, *v_dw2_t;                /* gradients (transposed form) */
+    _Float16 *v_w2_t;                            /* W2^T RM copy (for sync) */
     _Float16 *v_hidden, *v_logits;               /* fwd activations  */
     _Float16 *v_dlogits, *v_probs;               /* fwd intermediates */
     _Float16 *v_hidden_pre, *v_dhidden;          /* bwd intermediates */
@@ -102,8 +101,12 @@ struct mnist_context {
 
     /* HMX state */
     struct hmx_workspace hmx_ws;
-    uint32_t wh_w1t_off;    /* cached WH tiles for W1^T */
-    uint32_t wh_w2t_off;    /* cached WH tiles for W2^T */
+    uint32_t wh_w1t_off;    /* permanent WH tiles for W1^T */
+    uint32_t wh_w2t_off;    /* permanent WH tiles for W2^T */
+    uint32_t wh_w2_off;     /* permanent WH tiles for W2 (non-transposed, for backward dH) */
+    uint32_t wh_dw1_off;    /* dW1 output WH tiles */
+    uint32_t wh_dw2_off;    /* dW2 output WH tiles */
+    uint32_t wh_temp_off;   /* temp WH for backward B operand */
     int hmx_locked;
 
     int vtcm_ready;
@@ -162,14 +165,12 @@ static int setup_vtcm(struct mnist_context *ctx) {
     ctx->hmx_locked = 1;
 
     /* Bump-allocate f16 data buffers from front of VTCM.
-     * Only transposed weights are stored (no v_w1/v_w2). */
+     * NativeKV: W1^T, dW1, dW2 live only in WH tiles (no RM buffers).
+     * Only W2^T keeps an RM copy (needed for sync). */
     uint8_t *bump = ctx->vtcm_base;
     ctx->v_b1         = bump_alloc_f16(&bump, B1_F16);
     ctx->v_b2         = bump_alloc_f16(&bump, B2_F16);
-    ctx->v_w1_t       = bump_alloc_f16(&bump, W1_F16);    /* W1^T[832,128] */
-    ctx->v_w2_t       = bump_alloc_f16(&bump, W2_F16);    /* W2^T[128,64]  */
-    ctx->v_dw1_t      = bump_alloc_f16(&bump, W1_F16);    /* dW1^T[832,128] */
-    ctx->v_dw2_t      = bump_alloc_f16(&bump, DW2_F16);   /* dW2^T[128,64]  */
+    ctx->v_w2_t       = bump_alloc_f16(&bump, W2_F16);    /* W2^T[128,64] RM copy */
     ctx->v_hidden     = bump_alloc_f16(&bump, HIDDEN_F16(MAX_BATCH));
     ctx->v_logits     = bump_alloc_f16(&bump, LOGITS_F16(MAX_BATCH));
     ctx->v_dlogits    = bump_alloc_f16(&bump, LOGITS_F16(MAX_BATCH));
@@ -190,23 +191,65 @@ static int setup_vtcm(struct mnist_context *ctx) {
         return err;
     }
 
-    /* Convert f32 weights from DDR to f16, then transpose to VTCM.
-     * Use v_dw1_t as temp buffer for the non-transposed f16 weights. */
-    hvx_f32_to_f16(ctx->v_dw1_t, ctx->net_bufs[NET_BUF_W1],
-                    NET_HIDDEN_DIM * NET_INPUT_DIM_PAD);
-    blocked_transpose_f16_vtcm(ctx->v_w1_t, ctx->v_dw1_t,
-                           NET_HIDDEN_DIM, NET_INPUT_DIM_PAD);
+    /* Compute WH tile offsets for permanent weight/gradient storage.
+     * Layout in WH region:
+     *   [0..104):     W1^T permanent (104 tiles)
+     *   [104..112):   W2^T permanent (8 tiles)
+     *   [112..120):   W2 permanent (8 tiles)
+     *   [120..224):   dW1 output (104 tiles)
+     *   [224..232):   dW2 output (8 tiles)
+     *   [232..264):   temp WH for backward B operand (32 tiles, max for bs=256)
+     */
+    {
+        struct hmx_workspace *ws = &ctx->hmx_ws;
+        uint32_t w1t_tiles = (NET_HIDDEN_DIM / HMX_TILE) * (NET_INPUT_DIM_PAD / HMX_TILE); /* 4*26=104 */
+        uint32_t w2t_tiles = (NET_OUTPUT_DIM_PAD / HMX_TILE) * (NET_HIDDEN_DIM / HMX_TILE); /* 2*4=8 */
+        uint32_t w2_tiles  = (NET_HIDDEN_DIM / HMX_TILE) * (NET_OUTPUT_DIM_PAD / HMX_TILE); /* 4*2=8 */
 
-    hvx_f32_to_f16(ctx->v_dw2_t, ctx->net_bufs[NET_BUF_W2],
-                    NET_OUTPUT_DIM_PAD * NET_HIDDEN_DIM);
-    blocked_transpose_f16_vtcm(ctx->v_w2_t, ctx->v_dw2_t,
-                           NET_OUTPUT_DIM_PAD, NET_HIDDEN_DIM);
+        ctx->wh_w1t_off  = ws->wh_base;
+        ctx->wh_w2t_off  = ws->wh_base + w1t_tiles * HMX_ALIGN;
+        ctx->wh_w2_off   = ctx->wh_w2t_off + w2t_tiles * HMX_ALIGN;
+        ctx->wh_dw1_off  = ctx->wh_w2_off + w2_tiles * HMX_ALIGN;
+        ctx->wh_dw2_off  = ctx->wh_dw1_off + w1t_tiles * HMX_ALIGN;
+        ctx->wh_temp_off = ctx->wh_dw2_off + w2t_tiles * HMX_ALIGN;
+
+        FARF(HIGH, "NativeKV WH layout: w1t=%u w2t=%u w2=%u dw1=%u dw2=%u temp=%u",
+             ctx->wh_w1t_off, ctx->wh_w2t_off, ctx->wh_w2_off,
+             ctx->wh_dw1_off, ctx->wh_dw2_off, ctx->wh_temp_off);
+    }
+
+    /* Convert f32 weights from DDR to f16 -> transpose -> WH tiles.
+     * Use v_scratch as temp buffer (two halves: tmp1 and tmp2). */
+    {
+        struct hmx_workspace *ws = &ctx->hmx_ws;
+        _Float16 *tmp1 = ctx->v_scratch;
+
+        /* W1: f32 DDR -> f16 tmp1[128,832] -> transpose tmp2[832,128] -> WH tiles */
+        _Float16 *tmp2 = ctx->v_scratch + NET_HIDDEN_DIM * NET_INPUT_DIM_PAD;
+        hvx_f32_to_f16(tmp1, ctx->net_bufs[NET_BUF_W1],
+                        NET_HIDDEN_DIM * NET_INPUT_DIM_PAD);
+        blocked_transpose_f16_vtcm(tmp2, tmp1, NET_HIDDEN_DIM, NET_INPUT_DIM_PAD);
+        convert_rm_to_wh(ws, ctx->wh_w1t_off, tmp2, NET_INPUT_DIM_PAD, NET_HIDDEN_DIM);
+
+        /* W2: f32 DDR -> f16 tmp1[64,128] -> transpose tmp2[128,64] -> WH tiles + RM copy */
+        tmp2 = ctx->v_scratch + NET_OUTPUT_DIM_PAD * NET_HIDDEN_DIM;
+        hvx_f32_to_f16(tmp1, ctx->net_bufs[NET_BUF_W2],
+                        NET_OUTPUT_DIM_PAD * NET_HIDDEN_DIM);
+        /* tmp1 = W2[64,128] (non-transposed) */
+        blocked_transpose_f16_vtcm(tmp2, tmp1, NET_OUTPUT_DIM_PAD, NET_HIDDEN_DIM);
+        /* tmp2 = W2^T[128,64] */
+        convert_rm_to_wh(ws, ctx->wh_w2t_off, tmp2, NET_HIDDEN_DIM, NET_OUTPUT_DIM_PAD);
+        hvx_memcpy(ctx->v_w2_t, tmp2, NET_HIDDEN_DIM * NET_OUTPUT_DIM_PAD * sizeof(_Float16));
+
+        /* W2 non-transposed WH tiles (for backward dH): tmp1 still = W2[64,128] */
+        convert_rm_to_wh(ws, ctx->wh_w2_off, tmp1, NET_OUTPUT_DIM_PAD, NET_HIDDEN_DIM);
+    }
 
     hvx_f32_to_f16(ctx->v_b1, ctx->net_bufs[NET_BUF_B1], NET_HIDDEN_DIM);
     hvx_f32_to_f16(ctx->v_b2, ctx->net_bufs[NET_BUF_B2], NET_OUTPUT_DIM_PAD);
 
-    FARF(HIGH, "Weights: f32 DDR -> f16 transposed VTCM (%uKB)",
-         (W1_F16 + W2_F16) / 1024);
+    FARF(HIGH, "NativeKV: weights loaded to permanent WH tiles (%uKB in WH region)",
+         (W1_F16 + W2_F16 * 2) / 1024);
 
     ctx->vtcm_ready = 1;
     return AEE_SUCCESS;
@@ -229,10 +272,7 @@ static void do_train_batch(struct mnist_context *ctx,
     _Float16 *inp     = ctx->v_input;
     _Float16 *b1      = ctx->v_b1;
     _Float16 *b2      = ctx->v_b2;
-    _Float16 *w1_t    = ctx->v_w1_t;
     _Float16 *w2_t    = ctx->v_w2_t;
-    _Float16 *dw1_t   = ctx->v_dw1_t;
-    _Float16 *dw2_t   = ctx->v_dw2_t;
     _Float16 *hidden  = ctx->v_hidden;
     _Float16 *logits  = ctx->v_logits;
     _Float16 *dlogits = ctx->v_dlogits;
@@ -247,20 +287,9 @@ static void do_train_batch(struct mnist_context *ctx,
     uint64_t t_phase;
 
     /* === FORWARD === */
+    /* NativeKV: W1^T and W2^T already in permanent WH tiles — no conversion needed */
 
-    /* Cache W1^T and W2^T as WH tiles (weights don't change during forward) */
     t_phase = HAP_perf_get_time_us();
-    convert_rm_to_wh(ws, ws->wh_base, w1_t, NET_INPUT_DIM_PAD, NET_HIDDEN_DIM);
-    ctx->wh_w1t_off = ws->wh_base;
-    /* W2^T WH tiles placed after W1^T tiles */
-    {
-        uint32_t w1t_K  = NET_INPUT_DIM_PAD / HMX_TILE;  /* 26 */
-        uint32_t w1t_Nc = NET_HIDDEN_DIM / HMX_TILE;     /* 4  */
-        uint32_t w1t_wh_count = w1t_Nc * w1t_K;          /* 104 */
-        ctx->wh_w2t_off = ws->wh_base + w1t_wh_count * HMX_ALIGN;
-    }
-    convert_rm_to_wh(ws, ctx->wh_w2t_off, w2_t, NET_HIDDEN_DIM, NET_OUTPUT_DIM_PAD);
-
     /* Fwd L1: hidden[bs,128] = inp[bs,832] @ w1_t[832,128] */
     hmx_matmul_nn_f16_cached_wh(ws, hidden, inp, ctx->wh_w1t_off,
                                  bs, NET_HIDDEN_DIM, NET_INPUT_DIM_PAD);
@@ -305,12 +334,13 @@ static void do_train_batch(struct mnist_context *ctx,
     }
     ctx->time_bwd_other += (HAP_perf_get_time_us() - t_phase);
 
-    /* Bwd dW2: dw2_t[128,64] = hidden^T[128,bs] @ dlogits[bs,64]
-     * Transpose hidden[bs,128] -> scratch[128,bs], then NN matmul */
+    /* Bwd dW2: output to WH tiles directly
+     * dW2[128,64] = hidden^T[128,bs] @ dlogits[bs,64] */
     t_phase = HAP_perf_get_time_us();
     blocked_transpose_f16_vtcm(scratch, hidden, bs, NET_HIDDEN_DIM);
-    hmx_matmul_nn_f16(ws, dw2_t, scratch, dlogits,
-                       NET_HIDDEN_DIM, NET_OUTPUT_DIM_PAD, bs);
+    hmx_matmul_nn_f16_to_wh(ws, ctx->wh_dw2_off, ctx->wh_temp_off,
+                              scratch, dlogits,
+                              NET_HIDDEN_DIM, NET_OUTPUT_DIM_PAD, bs);
     ctx->time_bwd_mm += (HAP_perf_get_time_us() - t_phase);
 
     t_phase = HAP_perf_get_time_us();
@@ -318,12 +348,11 @@ static void do_train_batch(struct mnist_context *ctx,
     hvx_bias_backward_f16(db2_local, dlogits, bs, NET_OUTPUT_DIM_PAD);
     ctx->time_bwd_other += (HAP_perf_get_time_us() - t_phase);
 
-    /* Bwd dH: dhidden[bs,128] = dlogits[bs,64] @ w2_t^T[64,128]
-     * w2_t is [128,64], transpose to scratch[64,128], then NN matmul */
+    /* Bwd dH: dhidden[bs,128] = dlogits[bs,64] @ W2[64,128]
+     * Use cached W2_wh directly — no transpose needed! */
     t_phase = HAP_perf_get_time_us();
-    blocked_transpose_f16_vtcm(scratch, w2_t, NET_HIDDEN_DIM, NET_OUTPUT_DIM_PAD);
-    hmx_matmul_nn_f16(ws, dhidden, dlogits, scratch,
-                       bs, NET_HIDDEN_DIM, NET_OUTPUT_DIM_PAD);
+    hmx_matmul_nn_f16_cached_wh(ws, dhidden, dlogits, ctx->wh_w2_off,
+                                 bs, NET_HIDDEN_DIM, NET_OUTPUT_DIM_PAD);
     ctx->time_bwd_mm += (HAP_perf_get_time_us() - t_phase);
 
     t_phase = HAP_perf_get_time_us();
@@ -331,12 +360,13 @@ static void do_train_batch(struct mnist_context *ctx,
         bs * NET_HIDDEN_DIM);
     ctx->time_bwd_other += (HAP_perf_get_time_us() - t_phase);
 
-    /* Bwd dW1: dw1_t[832,128] = inp^T[832,bs] @ dhidden[bs,128]
-     * Transpose inp[bs,832] -> scratch[832,bs], then NN matmul */
+    /* Bwd dW1: output to WH tiles directly
+     * dW1[832,128] = inp^T[832,bs] @ dhidden[bs,128] */
     t_phase = HAP_perf_get_time_us();
     blocked_transpose_f16_vtcm(scratch, inp, bs, NET_INPUT_DIM_PAD);
-    hmx_matmul_nn_f16(ws, dw1_t, scratch, dhidden,
-                       NET_INPUT_DIM_PAD, NET_HIDDEN_DIM, bs);
+    hmx_matmul_nn_f16_to_wh(ws, ctx->wh_dw1_off, ctx->wh_temp_off,
+                              scratch, dhidden,
+                              NET_INPUT_DIM_PAD, NET_HIDDEN_DIM, bs);
     ctx->time_bwd_mm += (HAP_perf_get_time_us() - t_phase);
 
     t_phase = HAP_perf_get_time_us();
@@ -345,11 +375,29 @@ static void do_train_batch(struct mnist_context *ctx,
     ctx->time_bwd_other += (HAP_perf_get_time_us() - t_phase);
 
     /* === SGD UPDATE === */
+    /* NativeKV: SGD directly on WH tiles */
     uint64_t t_sgd = HAP_perf_get_time_us();
-    hvx_sgd_update_f16(w1_t, dw1_t, lr, NET_INPUT_DIM_PAD * NET_HIDDEN_DIM);
+    {
+        uint32_t w1t_elems = (NET_HIDDEN_DIM / HMX_TILE) * (NET_INPUT_DIM_PAD / HMX_TILE) * HMX_TILE_ELMS;
+        _Float16 *w1t_wh = (_Float16 *)(ws->vtcm_base + ctx->wh_w1t_off);
+        _Float16 *dw1_wh = (_Float16 *)(ws->vtcm_base + ctx->wh_dw1_off);
+        hvx_sgd_update_f16(w1t_wh, dw1_wh, lr, w1t_elems);
+    }
     hvx_sgd_update_f16(b1, db1_local, lr, NET_HIDDEN_DIM);
-    hvx_sgd_update_f16(w2_t, dw2_t, lr, NET_HIDDEN_DIM * NET_OUTPUT_DIM_PAD);
+    {
+        uint32_t w2t_elems = (NET_OUTPUT_DIM_PAD / HMX_TILE) * (NET_HIDDEN_DIM / HMX_TILE) * HMX_TILE_ELMS;
+        _Float16 *w2t_wh = (_Float16 *)(ws->vtcm_base + ctx->wh_w2t_off);
+        _Float16 *dw2_wh = (_Float16 *)(ws->vtcm_base + ctx->wh_dw2_off);
+        hvx_sgd_update_f16(w2t_wh, dw2_wh, lr, w2t_elems);
+    }
     hvx_sgd_update_f16(b2, db2_local, lr, NET_OUTPUT_DIM_PAD);
+
+    /* Update W2^T RM copy and W2_wh from updated W2^T_wh */
+    convert_wh_to_rm(&ctx->hmx_ws, w2_t, ctx->wh_w2t_off,
+                      NET_HIDDEN_DIM, NET_OUTPUT_DIM_PAD);
+    blocked_transpose_f16_vtcm(scratch, w2_t, NET_HIDDEN_DIM, NET_OUTPUT_DIM_PAD);
+    convert_rm_to_wh(&ctx->hmx_ws, ctx->wh_w2_off, scratch,
+                      NET_OUTPUT_DIM_PAD, NET_HIDDEN_DIM);
     ctx->time_sgd += (HAP_perf_get_time_us() - t_sgd);
 
     ctx->process_time += (HAP_perf_get_time_us() - t1);
@@ -368,19 +416,15 @@ static uint32_t do_eval_batch(struct mnist_context *ctx,
 {
     struct hmx_workspace *ws = &ctx->hmx_ws;
 
-    /* Cache weight WH tiles for eval (weights unchanged during eval) */
-    convert_rm_to_wh(ws, ws->wh_base, ctx->v_w1_t, NET_INPUT_DIM_PAD, NET_HIDDEN_DIM);
-    uint32_t w1t_wh_count = (NET_HIDDEN_DIM / HMX_TILE) * (NET_INPUT_DIM_PAD / HMX_TILE);
-    uint32_t wh_w2t_off = ws->wh_base + w1t_wh_count * HMX_ALIGN;
-    convert_rm_to_wh(ws, wh_w2t_off, ctx->v_w2_t, NET_HIDDEN_DIM, NET_OUTPUT_DIM_PAD);
+    /* NativeKV: W1^T and W2^T already in permanent WH tiles — no conversion needed */
 
     /* Forward pass using HMX matmul */
-    hmx_matmul_nn_f16_cached_wh(ws, ctx->v_hidden, ctx->v_input, ws->wh_base,
+    hmx_matmul_nn_f16_cached_wh(ws, ctx->v_hidden, ctx->v_input, ctx->wh_w1t_off,
                                  bs, NET_HIDDEN_DIM, NET_INPUT_DIM_PAD);
     hvx_add_bias_f16(ctx->v_hidden, ctx->v_b1, bs, NET_HIDDEN_DIM);
     hvx_relu_forward_f16(ctx->v_hidden, ctx->v_hidden, bs * NET_HIDDEN_DIM);
 
-    hmx_matmul_nn_f16_cached_wh(ws, ctx->v_logits, ctx->v_hidden, wh_w2t_off,
+    hmx_matmul_nn_f16_cached_wh(ws, ctx->v_logits, ctx->v_hidden, ctx->wh_w2t_off,
                                  bs, NET_OUTPUT_DIM_PAD, NET_HIDDEN_DIM);
     hvx_add_bias_f16(ctx->v_logits, ctx->v_b2, bs, NET_OUTPUT_DIM_PAD);
 
@@ -616,11 +660,13 @@ static void packet_callback(dspqueue_t queue, int error, void *context) {
                            DSPQUEUE_TIMEOUT_NONE);
 
         } else if (op == OP_SYNC && ctx->vtcm_ready) {
-            /* Transpose W_T back to standard layout, then convert f16->f32 to DDR.
-             * Use g_tn_a_buf (DDR static buffer) as scratch for the transposed f16. */
+            /* NativeKV: Convert W1^T from WH tiles -> RM -> transpose -> f32 DDR.
+             * Use v_scratch for WH->RM, g_tn_a_buf for transpose output. */
 
-            /* W1_T[832,128] -> W1[128,832] in scratch, then f16->f32 to DDR */
-            blocked_transpose_f16_vtcm((_Float16 *)g_tn_a_buf, ctx->v_w1_t,
+            /* W1^T: WH tiles -> RM (v_scratch) -> transpose (g_tn_a_buf) -> f32 DDR */
+            convert_wh_to_rm(&ctx->hmx_ws, ctx->v_scratch, ctx->wh_w1t_off,
+                              NET_INPUT_DIM_PAD, NET_HIDDEN_DIM);
+            blocked_transpose_f16_vtcm((_Float16 *)g_tn_a_buf, ctx->v_scratch,
                                        NET_INPUT_DIM_PAD, NET_HIDDEN_DIM);
             hvx_f16_to_f32(ctx->net_bufs[NET_BUF_W1], (_Float16 *)g_tn_a_buf,
                             NET_HIDDEN_DIM * NET_INPUT_DIM_PAD);

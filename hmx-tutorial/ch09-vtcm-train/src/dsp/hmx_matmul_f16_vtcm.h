@@ -4,9 +4,9 @@
 /*
  * HMX matrix multiply for f16 data in VTCM.
  *
- * Hot path uses direct HMX ASM + HVX, minimal hexkl:
+ * Hot path uses direct HMX ASM + HVX, no hexkl on hot path:
  *   AH (activation): HVX vshuff(-2) — 2-row interleave
- *   WH (weight):     hexkl rm_to_wh_f16 (DDR copy workaround)
+ *   WH (weight):     Pure HVX vshuff(-2) — 2-row interleave (same as AH)
  *   Compute:         ASM mxclracc.hf + mxmem:deep (batch tile loading)
  *   Readback:        ASM cvt.hf + mxmem store + HVX vdeal(-2)
  *
@@ -30,7 +30,7 @@
 #define HMX_TILE_BYTES   (HMX_TILE_ELMS * 2)
 #define HMX_ALIGN        HEXKL_HMX_ACTIVATION_ALIGNMENT   /* 2048 */
 
-/* DDR scratch buffer from hvx_matmul_f16_vtcm.h (for hexkl WH conversion) */
+/* DDR scratch buffer from hvx_matmul_f16_vtcm.h (used by OP_SYNC) */
 extern _Float16 g_tn_a_buf[];
 
 /* ================================================================== */
@@ -84,7 +84,12 @@ struct hmx_workspace {
  * - WH: 112 (fwd caches W1^T(104) + W2^T(8))
  */
 #define HMX_MAX_AH_TILES  208
-#define HMX_MAX_WH_TILES  112
+#define HMX_MAX_WH_TILES  264
+
+/* Forward declaration (defined below, needed by setup_hmx_workspace) */
+static void convert_rm_to_wh(struct hmx_workspace *ws,
+                              uint32_t wh_offset,
+                              const _Float16 *src, uint32_t k, uint32_t n);
 
 static int setup_hmx_workspace(struct hmx_workspace *ws,
                                 uint8_t *vtcm_base, uint32_t vtcm_size,
@@ -143,10 +148,12 @@ static int setup_hmx_workspace(struct hmx_workspace *ws,
             sv[i] = zero;
         hexkl_micro_hmx_rm_to_ah_f16(vtcm_base, ws->ah_base, ws->staging_off);
 
-        /* Prepare dummy WH tile (needs DDR source for hexkl restrict) */
-        memset(g_tn_a_buf, 0, HMX_TILE * HMX_TILE * sizeof(_Float16));
-        hexkl_micro_hmx_rm_to_wh_f16(vtcm_base, ws->wh_base,
-                                       g_tn_a_buf, 0, 0, HMX_TILE);
+        /* Prepare dummy WH tile using our pure HVX conversion */
+        {
+            _Float16 *staging_f16 = (_Float16 *)(vtcm_base + ws->staging_off);
+            /* staging is already zeroed above; convert as 32x32 tile */
+            convert_rm_to_wh(ws, ws->wh_base, staging_f16, HMX_TILE, HMX_TILE);
+        }
 
         /* Execute dummy matmul to configure HMX state */
         hexkl_micro_hmx_acc_clear_f16();
@@ -208,29 +215,62 @@ static void convert_rm_to_ah(struct hmx_workspace *ws,
 }
 
 /* ================================================================== */
-/*  WH tile conversion — hexkl (DDR copy workaround for restrict)      */
+/*  WH tile conversion — pure HVX (no hexkl dependency)                */
+/*                                                                     */
+/*  On v75, WH format is identical to AH: 2-way row interleaving.      */
+/*  Vector[i] = {row[2i][0], row[2i+1][0], row[2i][1], ...}           */
+/*  16 vectors per 32x32 tile.                                         */
+/*                                                                     */
+/*  Verified empirically against hexkl_micro_hmx_rm_to_wh_f16:         */
+/*    src[din][dout] -> wh_idx = (din>>1)*64 + dout*2 + (din&1)       */
+/*                                                                     */
+/*  Note: The Genie fromFlatOffset formula uses 4-row groups, which    */
+/*  does NOT match the actual v75 hexkl WH layout.                     */
 /* ================================================================== */
 
 static void convert_rm_to_wh(struct hmx_workspace *ws,
                               uint32_t wh_offset,
                               const _Float16 *src, uint32_t k, uint32_t n)
 {
-    /* Copy from VTCM to DDR (hexkl has restrict aliasing on src) */
-    uint32_t total_bytes = k * n * sizeof(_Float16);
-    uint32_t total_vecs = (total_bytes + 127) / 128;
-    for (uint32_t v = 0; v < total_vecs; v++)
-        ((HVX_Vector *)g_tn_a_buf)[v] = ((const HVX_Vector *)src)[v];
-
+    /*
+     * WH format on v75 is identical to AH: 2-way row interleaving at f16.
+     * Vector[i] = {row[2i][0], row[2i+1][0], row[2i][1], row[2i+1][1], ...}
+     * 16 vectors per 32x32 tile (each 128 bytes = 64 f16).
+     *
+     * Verified empirically by comparing against hexkl_micro_hmx_rm_to_wh_f16:
+     *   src[din][dout] -> wh_idx = (din >> 1) * 64 + dout * 2 + (din & 1)
+     * This is the vshuff(-2) interleave of row pairs, same as AH.
+     */
     uint32_t Nc = (n + HMX_TILE - 1) / HMX_TILE;
     uint32_t K  = (k + HMX_TILE - 1) / HMX_TILE;
 
     for (uint32_t ct = 0; ct < Nc; ct++) {
         for (uint32_t kt = 0; kt < K; kt++) {
             uint32_t tile_idx = ct * K + kt;
-            hexkl_micro_hmx_rm_to_wh_f16(
-                ws->vtcm_base,
-                wh_offset + tile_idx * HMX_ALIGN,
-                g_tn_a_buf, kt, ct, n);
+            HVX_Vector *out = (HVX_Vector *)(ws->vtcm_base + wh_offset
+                                              + tile_idx * HMX_ALIGN);
+
+            uint32_t row0 = kt * HMX_TILE;
+            uint32_t col0 = ct * HMX_TILE;
+            uint32_t cols = (col0 + HMX_TILE <= n) ? HMX_TILE : n - col0;
+
+            for (uint32_t rr = 0; rr < HMX_TILE / 2; rr++) {
+                uint32_t r_even = row0 + rr * 2;
+                uint32_t r_odd  = r_even + 1;
+
+                HVX_Vector v_r0 = Q6_V_vzero();
+                HVX_Vector v_r1 = Q6_V_vzero();
+
+                if (r_even < k)
+                    memcpy(&v_r0, src + (size_t)r_even * n + col0,
+                           cols * sizeof(_Float16));
+                if (r_odd < k)
+                    memcpy(&v_r1, src + (size_t)r_odd * n + col0,
+                           cols * sizeof(_Float16));
+
+                HVX_VectorPair vp = Q6_W_vshuff_VVR(v_r1, v_r0, -2);
+                out[rr] = Q6_V_lo_W(vp);
+            }
         }
     }
 }
@@ -340,6 +380,92 @@ static void hmx_matmul_nn_f16_cached_wh(
             }
 
             readback_acc_to_rm(ws, C, m, n, rt, ct);
+        }
+    }
+}
+
+/* ================================================================== */
+/*  WH tile → row-major conversion (reverse of convert_rm_to_wh)      */
+/* ================================================================== */
+
+static void convert_wh_to_rm(struct hmx_workspace *ws,
+                               _Float16 *dst, uint32_t wh_offset,
+                               uint32_t k, uint32_t n)
+{
+    uint32_t Nc = (n + HMX_TILE - 1) / HMX_TILE;
+    uint32_t K  = (k + HMX_TILE - 1) / HMX_TILE;
+
+    for (uint32_t ct = 0; ct < Nc; ct++) {
+        for (uint32_t kt = 0; kt < K; kt++) {
+            uint32_t tile_idx = ct * K + kt;
+            const HVX_Vector *tv = (const HVX_Vector *)(ws->vtcm_base + wh_offset
+                                                         + tile_idx * HMX_ALIGN);
+
+            uint32_t row0 = kt * HMX_TILE;
+            uint32_t col0 = ct * HMX_TILE;
+            uint32_t cols = (col0 + HMX_TILE <= n) ? HMX_TILE : n - col0;
+
+            for (uint32_t rr = 0; rr < HMX_TILE / 2; rr++) {
+                uint32_t r_even = row0 + rr * 2;
+                uint32_t r_odd  = r_even + 1;
+
+                HVX_VectorPair dealt = Q6_W_vdeal_VVR(Q6_V_vzero(), tv[rr], -2);
+                HVX_Vector v_even = Q6_V_lo_W(dealt);
+                HVX_Vector v_odd  = Q6_V_hi_W(dealt);
+
+                if (r_even < k)
+                    memcpy(dst + (size_t)r_even * n + col0, &v_even, cols * sizeof(_Float16));
+                if (r_odd < k)
+                    memcpy(dst + (size_t)r_odd * n + col0, &v_odd, cols * sizeof(_Float16));
+            }
+        }
+    }
+}
+
+/* ================================================================== */
+/*  HMX matmul with output stored as WH tiles (not row-major)         */
+/*                                                                     */
+/*  C_wh[out_wh_offset] = A[m,k] @ B[k,n]                            */
+/*  Output tiles stored in WH layout: tile[ct*Mr+rt]                  */
+/*  Since AH format == WH format on v75 (2-row interleave),           */
+/*  hmx_store_acc_tile output can be used directly as WH input.        */
+/* ================================================================== */
+
+static void hmx_matmul_nn_f16_to_wh(
+    struct hmx_workspace *ws,
+    uint32_t out_wh_offset,
+    uint32_t b_wh_temp_offset,
+    const _Float16 *A, const _Float16 *B,
+    uint32_t m, uint32_t n, uint32_t k)
+{
+    uint32_t Mr = (m + HMX_TILE - 1) / HMX_TILE;
+    uint32_t Nc = (n + HMX_TILE - 1) / HMX_TILE;
+    uint32_t K  = (k + HMX_TILE - 1) / HMX_TILE;
+
+    convert_rm_to_ah(ws, ws->ah_base, A, m, k);
+    convert_rm_to_wh(ws, b_wh_temp_offset, B, k, n);
+
+    for (uint32_t rt = 0; rt < Mr; rt++) {
+        for (uint32_t ct = 0; ct < Nc; ct++) {
+            hmx_clear_acc();
+
+            const uint8_t *act_ptr = ws->vtcm_base + ws->ah_base
+                                     + rt * K * HMX_ALIGN;
+            const uint8_t *wt_ptr  = ws->vtcm_base + b_wh_temp_offset
+                                     + ct * K * HMX_ALIGN;
+
+            for (uint32_t kt = 0; kt < K; kt += 32) {
+                uint32_t batch = (K - kt < 32) ? K - kt : 32;
+                hmx_load_tiles(act_ptr + kt * HMX_ALIGN,
+                               wt_ptr  + kt * HMX_ALIGN,
+                               batch);
+            }
+
+            /* Store output tile in WH layout: tile[ct * Mr + rt] */
+            uint32_t wh_tile_idx = ct * Mr + rt;
+            _Float16 *tile_out = (_Float16 *)(ws->vtcm_base + out_wh_offset
+                                               + wh_tile_idx * HMX_ALIGN);
+            hmx_store_acc_tile(tile_out);
         }
     }
 }
