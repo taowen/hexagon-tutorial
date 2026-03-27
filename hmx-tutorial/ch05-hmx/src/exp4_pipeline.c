@@ -353,10 +353,17 @@ static void compute_direct_asm(
     uint8_t *vtcm, float *out_f32,
     uint32_t m, uint32_t n, uint32_t k,
     uint32_t act_base, uint32_t wt_base,
+    uint32_t scales_off,
     uint32_t staging, uint32_t readback, uint32_t cfg)
 {
     const uint32_t K     = (k + TILE - 1) / TILE;
     const uint32_t ALIGN = HEXKL_HMX_ACTIVATION_ALIGNMENT;
+
+    /* Must set scales before direct ASM compute — HMX is a stateful
+     * coprocessor.  Without this, Method C only worked by accident
+     * because Method A (hexkl_micro_hmx_mm_f16) had already configured
+     * the HMX scale/bias registers as a side-effect. */
+    hmx_set_scales(vtcm + scales_off);
 
     for (uint32_t row = 0; row < m; row += TILE) {
         uint32_t rt = row / TILE;
@@ -682,11 +689,11 @@ int main(void) {
         /* ---- Method C: direct ASM compute + hexkl readback ---- */
         {
             compute_direct_asm(vtcm, C_f32, m, n, k,
-                               act_base, wt_base, staging, readback, cfg_off);
+                               act_base, wt_base, scales_off, staging, readback, cfg_off);
             uint64_t t0 = HAP_perf_get_time_us();
             for (int iter = 0; iter < N_ITERS; iter++)
                 compute_direct_asm(vtcm, C_f32, m, n, k,
-                                   act_base, wt_base, staging, readback, cfg_off);
+                                   act_base, wt_base, scales_off, staging, readback, cfg_off);
             uint64_t t1 = HAP_perf_get_time_us();
             float md = 0;
             int pass = verify_f32_vs_f16ref(C_f32, C_ref, m * n, &md);
@@ -746,11 +753,11 @@ int main(void) {
             double avg_a = (double)(t1 - t0) / N_ITERS;
 
             compute_direct_asm(vtcm, C_f32, m, n, k,
-                               act_base, wt_base, staging, readback, cfg_off);
+                               act_base, wt_base, scales_off, staging, readback, cfg_off);
             t0 = HAP_perf_get_time_us();
             for (int iter = 0; iter < N_ITERS; iter++)
                 compute_direct_asm(vtcm, C_f32, m, n, k,
-                                   act_base, wt_base, staging, readback, cfg_off);
+                                   act_base, wt_base, scales_off, staging, readback, cfg_off);
             t1 = HAP_perf_get_time_us();
             double avg_c = (double)(t1 - t0) / N_ITERS;
 

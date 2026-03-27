@@ -82,8 +82,21 @@ $HEX_CC -mv75 $HEX_LDFLAGS \
     -Wl,--start-group "$HEXKL/lib/hexagon_toolv19_v75/libhexkl_micro.a" "$HEXKL/lib/hexagon_toolv19_v75/libhexkl_macro.a" -Wl,--end-group \
     -o "$BUILD_DIR/libexp4_pipeline.so"
 
+# ---------- exp5_standalone_asm (DSP side .so -- hexkl_micro.a + hexkl_macro.a, -mhmx) ----------
+echo "=== Compiling exp5_standalone_asm.c ==="
+$HEX_CC $HEX_CFLAGS -mhmx $HEX_INCLUDES \
+    -c "$SCRIPT_DIR/src/exp5_standalone_asm.c" \
+    -o "$BUILD_DIR/exp5_standalone_asm.obj"
+
+echo "=== Linking libexp5_standalone_asm.so ==="
+$HEX_CC -mv75 $HEX_LDFLAGS \
+    "$BUILD_DIR/exp5_standalone_asm.obj" \
+    -Wl,--start-group "$HEXKL/lib/hexagon_toolv19_v75/libhexkl_micro.a" "$HEXKL/lib/hexagon_toolv19_v75/libhexkl_macro.a" -Wl,--end-group \
+    -o "$BUILD_DIR/libexp5_standalone_asm.so"
+
 echo "=== Build complete ==="
-echo "  DSP exp1_tile_basics:  $BUILD_DIR/libexp1_tile_basics.so"
-echo "  DSP exp2_weight_layout: $BUILD_DIR/libexp2_weight_layout.so"
-echo "  DSP exp3_streaming:    $BUILD_DIR/libexp3_streaming.so"
-echo "  DSP exp4_pipeline:     $BUILD_DIR/libexp4_pipeline.so"
+echo "  DSP exp1_tile_basics:    $BUILD_DIR/libexp1_tile_basics.so"
+echo "  DSP exp2_weight_layout:  $BUILD_DIR/libexp2_weight_layout.so"
+echo "  DSP exp3_streaming:      $BUILD_DIR/libexp3_streaming.so"
+echo "  DSP exp4_pipeline:       $BUILD_DIR/libexp4_pipeline.so"
+echo "  DSP exp5_standalone_asm: $BUILD_DIR/libexp5_standalone_asm.so"

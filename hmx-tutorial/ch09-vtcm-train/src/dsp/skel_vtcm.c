@@ -1,10 +1,9 @@
 /*
- * ch09: dspqueue + VTCM-resident f16 training skel (HVX widening multiply)
+ * ch09: dspqueue + VTCM-resident f16 training skel (HMX matrix accelerator)
  *
  * All network data (weights, activations, gradients) stored as f16 in VTCM.
- * Matrix multiplications use HVX widening multiply (Q6_Wqf32_vmpy_Vqf16Vhf)
- * for qf32 internal accumulation directly from f16 operands -- no scalar
- * f16<->f32 conversion, no DDR scratch buffers.
+ * Matrix multiplications use HMX (Hexagon Matrix eXtension) via direct ASM
+ * for compute and hexkl_micro for tile format conversions.
  *
  * All non-matmul ops use HVX vectorized functions directly on VTCM data
  * (128B-aligned rows, NET_OUTPUT_DIM_PAD=64 = 1 HVX vector per row).
@@ -12,7 +11,7 @@
  * ARM sends f16 input directly (no f32->f16 conversion on DSP).
  *
  * VTCM layout:
- *   [f16 data buffers (~800KB)]
+ *   [f16 data buffers (~800KB)] [HMX workspace: AH/WH/out tiles, scales, staging]
  */
 
 #include <stdlib.h>
@@ -22,6 +21,7 @@
 #include "dsp/hvx_ops.h"
 #include "dsp/hvx_ops_f16.h"
 #include "dsp/hvx_matmul_f16_vtcm.h"
+#include "dsp/hmx_matmul_f16_vtcm.h"
 #include "hexkl_micro.h"
 #include "common/protocol.h"
 
@@ -98,6 +98,13 @@ struct mnist_context {
     _Float16 *v_dlogits, *v_probs;               /* fwd intermediates */
     _Float16 *v_hidden_pre, *v_dhidden;          /* bwd intermediates */
     _Float16 *v_input;                           /* per-batch input   */
+    _Float16 *v_scratch;                         /* transpose scratch buffer */
+
+    /* HMX state */
+    struct hmx_workspace hmx_ws;
+    uint32_t wh_w1t_off;    /* cached WH tiles for W1^T */
+    uint32_t wh_w2t_off;    /* cached WH tiles for W2^T */
+    int hmx_locked;
 
     int vtcm_ready;
 };
@@ -123,12 +130,19 @@ AEEResult mnist_train_close(remote_handle64 handle) {
     struct mnist_context *ctx = (struct mnist_context *)handle;
     if (!ctx) return AEE_EBADPARM;
     if (ctx->queue) return AEE_EITEMBUSY;
+    if (ctx->hmx_locked) {
+        hexkl_micro_hmx_unlock();
+        ctx->hmx_locked = 0;
+    }
     free(ctx);
     return AEE_SUCCESS;
 }
 
 
-/* ========== VTCM setup: allocate f16 data buffers ========== */
+/* ========== VTCM setup: allocate f16 data buffers + HMX workspace ========== */
+
+/* Largest scratch needed: X^T at bs=256 -> 832*256*2 = 416KB */
+#define SCRATCH_F16  (NET_INPUT_DIM_PAD * MAX_BATCH * 2)
 
 static int setup_vtcm(struct mnist_context *ctx) {
     /* hexkl_micro_hw_init acquires VTCM */
@@ -138,6 +152,14 @@ static int setup_vtcm(struct mnist_context *ctx) {
         return err;
     }
     FARF(HIGH, "VTCM acquired: %u KB at %p", ctx->vtcm_size / 1024, ctx->vtcm_base);
+
+    /* Lock HMX */
+    err = hexkl_micro_hmx_lock();
+    if (err != AEE_SUCCESS) {
+        FARF(ERROR, "hexkl_micro_hmx_lock failed: 0x%08x", (unsigned)err);
+        return err;
+    }
+    ctx->hmx_locked = 1;
 
     /* Bump-allocate f16 data buffers from front of VTCM.
      * Only transposed weights are stored (no v_w1/v_w2). */
@@ -155,10 +177,18 @@ static int setup_vtcm(struct mnist_context *ctx) {
     ctx->v_hidden_pre = bump_alloc_f16(&bump, HIDDEN_F16(MAX_BATCH));
     ctx->v_dhidden    = bump_alloc_f16(&bump, HIDDEN_F16(MAX_BATCH));
     ctx->v_input      = bump_alloc_f16(&bump, INPUT_F16(MAX_BATCH));
+    ctx->v_scratch    = bump_alloc_f16(&bump, SCRATCH_F16);
 
     uint32_t data_used = (uint32_t)((uintptr_t)bump - (uintptr_t)ctx->vtcm_base);
-    FARF(HIGH, "VTCM layout: data=%uKB, total=%uKB",
+    FARF(HIGH, "VTCM layout: data=%uKB (incl scratch), total=%uKB",
          data_used / 1024, ctx->vtcm_size / 1024);
+
+    /* Setup HMX workspace after data buffers */
+    err = setup_hmx_workspace(&ctx->hmx_ws, ctx->vtcm_base, ctx->vtcm_size, data_used);
+    if (err != AEE_SUCCESS) {
+        FARF(ERROR, "setup_hmx_workspace failed: 0x%08x", (unsigned)err);
+        return err;
+    }
 
     /* Convert f32 weights from DDR to f16, then transpose to VTCM.
      * Use v_dw1_t as temp buffer for the non-transposed f16 weights. */
@@ -210,13 +240,30 @@ static void do_train_batch(struct mnist_context *ctx,
     _Float16 *hidden_pre = ctx->v_hidden_pre;
     _Float16 *dhidden = ctx->v_dhidden;
 
+    struct hmx_workspace *ws = &ctx->hmx_ws;
+    _Float16 *scratch = ctx->v_scratch;
+
     uint64_t t1 = HAP_perf_get_time_us();
     uint64_t t_phase;
 
     /* === FORWARD === */
+
+    /* Cache W1^T and W2^T as WH tiles (weights don't change during forward) */
     t_phase = HAP_perf_get_time_us();
-    matmul_nn_f16_2x(hidden, inp, w1_t,
-                     bs, NET_HIDDEN_DIM, NET_INPUT_DIM_PAD);
+    convert_rm_to_wh(ws, ws->wh_base, w1_t, NET_INPUT_DIM_PAD, NET_HIDDEN_DIM);
+    ctx->wh_w1t_off = ws->wh_base;
+    /* W2^T WH tiles placed after W1^T tiles */
+    {
+        uint32_t w1t_K  = NET_INPUT_DIM_PAD / HMX_TILE;  /* 26 */
+        uint32_t w1t_Nc = NET_HIDDEN_DIM / HMX_TILE;     /* 4  */
+        uint32_t w1t_wh_count = w1t_Nc * w1t_K;          /* 104 */
+        ctx->wh_w2t_off = ws->wh_base + w1t_wh_count * HMX_ALIGN;
+    }
+    convert_rm_to_wh(ws, ctx->wh_w2t_off, w2_t, NET_HIDDEN_DIM, NET_OUTPUT_DIM_PAD);
+
+    /* Fwd L1: hidden[bs,128] = inp[bs,832] @ w1_t[832,128] */
+    hmx_matmul_nn_f16_cached_wh(ws, hidden, inp, ctx->wh_w1t_off,
+                                 bs, NET_HIDDEN_DIM, NET_INPUT_DIM_PAD);
     ctx->time_fwd_mm += (HAP_perf_get_time_us() - t_phase);
 
     t_phase = HAP_perf_get_time_us();
@@ -225,9 +272,10 @@ static void do_train_batch(struct mnist_context *ctx,
     hvx_relu_forward_f16(hidden, hidden, bs * NET_HIDDEN_DIM);
     ctx->time_fwd_other += (HAP_perf_get_time_us() - t_phase);
 
+    /* Fwd L2: logits[bs,64] = hidden[bs,128] @ w2_t[128,64] */
     t_phase = HAP_perf_get_time_us();
-    matmul_nn_f16(logits, hidden, w2_t,
-                  bs, NET_OUTPUT_DIM_PAD, NET_HIDDEN_DIM);
+    hmx_matmul_nn_f16_cached_wh(ws, logits, hidden, ctx->wh_w2t_off,
+                                 bs, NET_OUTPUT_DIM_PAD, NET_HIDDEN_DIM);
     ctx->time_fwd_mm += (HAP_perf_get_time_us() - t_phase);
 
     t_phase = HAP_perf_get_time_us();
@@ -257,10 +305,12 @@ static void do_train_batch(struct mnist_context *ctx,
     }
     ctx->time_bwd_other += (HAP_perf_get_time_us() - t_phase);
 
+    /* Bwd dW2: dw2_t[128,64] = hidden^T[128,bs] @ dlogits[bs,64]
+     * Transpose hidden[bs,128] -> scratch[128,bs], then NN matmul */
     t_phase = HAP_perf_get_time_us();
-    hvx_memzero(dw2_t, NET_HIDDEN_DIM * NET_OUTPUT_DIM_PAD * sizeof(_Float16));
-    matmul_tn_f16(dw2_t, hidden, dlogits,
-                   NET_HIDDEN_DIM, NET_OUTPUT_DIM_PAD, bs);
+    blocked_transpose_f16_vtcm(scratch, hidden, bs, NET_HIDDEN_DIM);
+    hmx_matmul_nn_f16(ws, dw2_t, scratch, dlogits,
+                       NET_HIDDEN_DIM, NET_OUTPUT_DIM_PAD, bs);
     ctx->time_bwd_mm += (HAP_perf_get_time_us() - t_phase);
 
     t_phase = HAP_perf_get_time_us();
@@ -268,9 +318,12 @@ static void do_train_batch(struct mnist_context *ctx,
     hvx_bias_backward_f16(db2_local, dlogits, bs, NET_OUTPUT_DIM_PAD);
     ctx->time_bwd_other += (HAP_perf_get_time_us() - t_phase);
 
+    /* Bwd dH: dhidden[bs,128] = dlogits[bs,64] @ w2_t^T[64,128]
+     * w2_t is [128,64], transpose to scratch[64,128], then NN matmul */
     t_phase = HAP_perf_get_time_us();
-    matmul_nt_f16(dhidden, dlogits, w2_t,
-                  bs, NET_HIDDEN_DIM, NET_OUTPUT_DIM_PAD);
+    blocked_transpose_f16_vtcm(scratch, w2_t, NET_HIDDEN_DIM, NET_OUTPUT_DIM_PAD);
+    hmx_matmul_nn_f16(ws, dhidden, dlogits, scratch,
+                       bs, NET_HIDDEN_DIM, NET_OUTPUT_DIM_PAD);
     ctx->time_bwd_mm += (HAP_perf_get_time_us() - t_phase);
 
     t_phase = HAP_perf_get_time_us();
@@ -278,10 +331,12 @@ static void do_train_batch(struct mnist_context *ctx,
         bs * NET_HIDDEN_DIM);
     ctx->time_bwd_other += (HAP_perf_get_time_us() - t_phase);
 
+    /* Bwd dW1: dw1_t[832,128] = inp^T[832,bs] @ dhidden[bs,128]
+     * Transpose inp[bs,832] -> scratch[832,bs], then NN matmul */
     t_phase = HAP_perf_get_time_us();
-    hvx_memzero(dw1_t, NET_INPUT_DIM_PAD * NET_HIDDEN_DIM * sizeof(_Float16));
-    matmul_tn_f16(dw1_t, inp, dhidden,
-                   NET_INPUT_DIM_PAD, NET_HIDDEN_DIM, bs);
+    blocked_transpose_f16_vtcm(scratch, inp, bs, NET_INPUT_DIM_PAD);
+    hmx_matmul_nn_f16(ws, dw1_t, scratch, dhidden,
+                       NET_INPUT_DIM_PAD, NET_HIDDEN_DIM, bs);
     ctx->time_bwd_mm += (HAP_perf_get_time_us() - t_phase);
 
     t_phase = HAP_perf_get_time_us();
@@ -311,14 +366,22 @@ static void do_train_batch(struct mnist_context *ctx,
 static uint32_t do_eval_batch(struct mnist_context *ctx,
                               const uint8_t *labels, uint32_t bs)
 {
-    /* Forward pass using widening multiply matmul */
-    matmul_nn_f16_2x(ctx->v_hidden, ctx->v_input, ctx->v_w1_t,
-                     bs, NET_HIDDEN_DIM, NET_INPUT_DIM_PAD);
+    struct hmx_workspace *ws = &ctx->hmx_ws;
+
+    /* Cache weight WH tiles for eval (weights unchanged during eval) */
+    convert_rm_to_wh(ws, ws->wh_base, ctx->v_w1_t, NET_INPUT_DIM_PAD, NET_HIDDEN_DIM);
+    uint32_t w1t_wh_count = (NET_HIDDEN_DIM / HMX_TILE) * (NET_INPUT_DIM_PAD / HMX_TILE);
+    uint32_t wh_w2t_off = ws->wh_base + w1t_wh_count * HMX_ALIGN;
+    convert_rm_to_wh(ws, wh_w2t_off, ctx->v_w2_t, NET_HIDDEN_DIM, NET_OUTPUT_DIM_PAD);
+
+    /* Forward pass using HMX matmul */
+    hmx_matmul_nn_f16_cached_wh(ws, ctx->v_hidden, ctx->v_input, ws->wh_base,
+                                 bs, NET_HIDDEN_DIM, NET_INPUT_DIM_PAD);
     hvx_add_bias_f16(ctx->v_hidden, ctx->v_b1, bs, NET_HIDDEN_DIM);
     hvx_relu_forward_f16(ctx->v_hidden, ctx->v_hidden, bs * NET_HIDDEN_DIM);
 
-    matmul_nn_f16(ctx->v_logits, ctx->v_hidden, ctx->v_w2_t,
-                  bs, NET_OUTPUT_DIM_PAD, NET_HIDDEN_DIM);
+    hmx_matmul_nn_f16_cached_wh(ws, ctx->v_logits, ctx->v_hidden, wh_w2t_off,
+                                 bs, NET_OUTPUT_DIM_PAD, NET_HIDDEN_DIM);
     hvx_add_bias_f16(ctx->v_logits, ctx->v_b2, bs, NET_OUTPUT_DIM_PAD);
 
     /* Count correct predictions */

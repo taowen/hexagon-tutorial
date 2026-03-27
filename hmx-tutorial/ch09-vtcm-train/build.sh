@@ -2,10 +2,10 @@
 set -euo pipefail
 
 #
-# ch09: Build VTCM Training (HVX f16)
+# ch09: Build VTCM Training (HMX f16)
 #
 # Produces:
-#   libmnist_train_skel.so  -- skel_vtcm.c (VTCM-resident f16 training with HVX)
+#   libmnist_train_skel.so  -- skel_vtcm.c (VTCM-resident f16 training with HMX)
 #   train_vtcm              -- ARM driver with DSP-side evaluation
 #
 # Reuses from ch08: IDL stubs, mnist_train_skel.obj, dspqueue infrastructure
@@ -44,8 +44,8 @@ mkdir -p "$BUILD"
 # ========================================
 # Step 2: Compile skel_vtcm.c (DSP, HMX f16)
 # ========================================
-echo "[2/4] Compiling skel_vtcm.c (HVX f16) ..."
-DSP_FLAGS=(-mv75 -O2 -fPIC -mhvx -mhvx-length=128B)
+echo "[2/4] Compiling skel_vtcm.c (HMX f16) ..."
+DSP_FLAGS=(-mv75 -O2 -fPIC -mhvx -mhvx-length=128B -mhmx)
 DSP_INCS=(
     -I "$SDK/incs"
     -I "$SDK/incs/stddef"
@@ -64,7 +64,7 @@ echo "  -> $BUILD/skel_vtcm.obj"
 # Step 3: Link libmnist_train_skel.so (with hexkl_micro)
 # ========================================
 echo "[3/4] Linking libmnist_train_skel.so ..."
-"$HCC" -mv75 -shared -Wl,-Bsymbolic \
+"$HCC" -mv75 -mhmx -shared -Wl,-Bsymbolic \
     "$BUILD/skel_vtcm.obj" \
     "$CH08_BUILD/mnist_train_skel.obj" \
     -Wl,--start-group "$HEXKL/lib/hexagon_toolv19_v75/libhexkl_micro.a" -Wl,--end-group \
@@ -104,7 +104,7 @@ echo "  Build complete!"
 echo "========================================"
 echo ""
 echo "Artifacts:"
-echo "  libmnist_train_skel.so:  $BUILD/libmnist_train_skel.so  (HVX f16 + VTCM)"
+echo "  libmnist_train_skel.so:  $BUILD/libmnist_train_skel.so  (HMX f16 + VTCM)"
 echo "  train_vtcm:              $BUILD/train_vtcm"
 echo ""
 echo "Next: bash run_device.sh"
