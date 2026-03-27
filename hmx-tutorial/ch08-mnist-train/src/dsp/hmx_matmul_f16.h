@@ -11,12 +11,12 @@ static uint8_t *g_vtcm_base_f16;
 static uint32_t g_vtcm_size_f16;
 
 /* Scratch buffer for transpose operations.
- * Largest transpose: max(128*800, 128*128) = 102400 elements */
-#define F16_MAX_SCRATCH (256 * 800)
+ * Largest transpose: max(128*832, 128*128) = 106496 elements */
+#define F16_MAX_SCRATCH (256 * 832)
 static _Float16 g_scratch_f16[F16_MAX_SCRATCH] __attribute__((aligned(128)));
 
 /* Temporary output buffer for accumulate mode */
-#define F16_MAX_OUT (256 * 800)
+#define F16_MAX_OUT (256 * 832)
 static _Float16 g_out_f16[F16_MAX_OUT] __attribute__((aligned(128)));
 
 /* Cache-friendly blocked transpose for f16 matrices.
@@ -101,6 +101,74 @@ static void hmx_matmul_f16_core(
             hexkl_micro_hmx_ah_to_rm_f16(vtcm, staging_off, readback_off);
             hexkl_micro_hmx_copy_f16_to_submatrix(
                 vtcm, staging_off, C, row / F16_TILE, col / F16_TILE, m, n);
+        }
+    }
+}
+
+/*
+ * HMX matmul with pre-cached WH weights already in VTCM.
+ * C_f16[m x n] = A_f16[m x k] @ B_wh (already in WH tiles at wh_off)
+ *
+ * All offsets are relative to vtcm_base (the overall VTCM base pointer).
+ * The WH tiles are stored at: wh_off + (ct * K + kt) * F16_ALIGN
+ * where ct = col_tile, kt = k_tile, K = ceil(k/32)
+ *
+ * Workspace region: [act AH tiles][staging][readback] + config at end
+ */
+static void hmx_matmul_f16_wh_cached(
+    uint8_t *vtcm_base,           /* overall VTCM base (ctx->vtcm_base) */
+    uint32_t ws_off,              /* workspace offset from vtcm_base */
+    uint32_t ws_size,             /* workspace size */
+    _Float16 *C, const _Float16 *A,
+    uint32_t wh_off,              /* WH cache offset from vtcm_base */
+    uint32_t m, uint32_t n, uint32_t k)
+{
+    const uint32_t K  = (k + F16_TILE - 1) / F16_TILE;
+    const uint32_t Nc = (n + F16_TILE - 1) / F16_TILE;
+
+    /* Workspace layout (all offsets from vtcm_base):
+     * [act_0..act_K-1][staging][readback] ... [config] */
+    const uint32_t act_base     = ws_off;
+    const uint32_t staging_off  = ws_off + F16_ALIGN * K;
+    const uint32_t readback_off = ws_off + F16_ALIGN * (K + 1);
+
+    uint32_t needed = F16_ALIGN * (K + 2) + hexkl_micro_hmx_config_size();
+    if (needed > ws_size) {
+        FARF(ERROR, "f16 wh_cached: workspace too small: need %u, have %u",
+             needed, ws_size);
+        return;
+    }
+
+    uint32_t cfg_off = ws_off + ws_size - hexkl_micro_hmx_config_size();
+    hexkl_micro_hmx_setup_acc_read_f16(vtcm_base, cfg_off);
+
+    /* NO weight conversion -- weights already in WH at wh_off */
+
+    for (uint32_t row = 0; row < m; row += F16_TILE) {
+        /* Load activation strip into workspace */
+        for (uint32_t i = 0; i < K; i++) {
+            hexkl_micro_hmx_copy_submatrix_to_f16(
+                vtcm_base, staging_off, A, row / F16_TILE, i, m, k);
+            hexkl_micro_hmx_rm_to_ah_f16(
+                vtcm_base, act_base + F16_ALIGN * i, staging_off);
+        }
+
+        for (uint32_t col = 0; col < n; col += F16_TILE) {
+            hexkl_micro_hmx_acc_clear_f16();
+
+            for (uint32_t i = 0; i < K; i++) {
+                /* Reference pre-cached WH tile directly */
+                uint32_t wt_off = wh_off + ((col / F16_TILE) * K + i) * F16_ALIGN;
+                hexkl_micro_hmx_mm_f16(
+                    vtcm_base, act_base + F16_ALIGN * i, wt_off);
+            }
+
+            /* Read accumulator as f16 and copy out */
+            hexkl_micro_hmx_acc_read_f16(vtcm_base, cfg_off, readback_off);
+            hexkl_micro_hmx_ah_to_rm_f16(vtcm_base, staging_off, readback_off);
+            hexkl_micro_hmx_copy_f16_to_submatrix(
+                vtcm_base, staging_off, C,
+                row / F16_TILE, col / F16_TILE, m, n);
         }
     }
 }

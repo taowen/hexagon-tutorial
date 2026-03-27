@@ -18,10 +18,10 @@
  * ==================================================================== */
 
 #define INPUT_DIM       784
-#define INPUT_DIM_PAD   800     /* padded to multiple of 32 */
+#define INPUT_DIM_PAD   832     /* padded to 13x64 for HVX alignment (832*2=13*128B) */
 #define HIDDEN_DIM      128
 #define OUTPUT_DIM      10
-#define OUTPUT_DIM_PAD  32      /* padded to multiple of 32 */
+#define OUTPUT_DIM_PAD  64      /* padded to 64 for HVX alignment (64*2=128B=1 vector) */
 
 static int g_batch_size = 32;
 #define LEARNING_RATE   0.1f

@@ -194,4 +194,245 @@ static float hvx_softmax_cross_entropy_f16(
     return total_loss / (float)batch;
 }
 
+/* =========================================================================
+ * HVX polynomial softmax + cross-entropy (vectorized, f16 in/out)
+ *
+ * Each row is one HVX vector (64 x f16, NET_OUTPUT_DIM_PAD=64).
+ * Only elements [0..NET_OUTPUT_DIM-1] are active; the rest are masked to -inf.
+ *
+ * Polynomial exp approximation ported from QNN SDK ExampleOpPackageSoftmax.cpp:
+ *   x_scaled = (logit - max) / ln(2)
+ *   Split into integer exponent n and normalized mantissa m (|m| in [1,2))
+ *   exp(r) ~ c0 + c1*m + c2*m^2 + c3*m^3   (where r = m * ln(2))
+ *   2^n computed via repeated squaring + vmux select
+ *   exp(x_scaled) = poly^(2^n)
+ * ========================================================================= */
+
+static inline void hvx_softmax_cross_entropy_f16_vec(
+    const uint16_t* logits,    /* [batch_size * NET_OUTPUT_DIM_PAD] in VTCM, 128B-aligned rows */
+    uint16_t* probs,           /* [batch_size * NET_OUTPUT_DIM_PAD] output probs */
+    const uint8_t* labels,     /* [batch_size] ground truth labels */
+    int batch_size,
+    float* total_loss,         /* output: sum of cross-entropy losses */
+    int* total_correct         /* output: count of correct predictions */
+)
+{
+    /* Polynomial coefficients for exp2 approximation on mantissa range:
+     * exp2(m) ~ c0 + c1*m + c2*m^2 + c3*m^3  for m in [1,2) */
+    union { float f; int32_t i; } scaleu, uc0, uc1, uc2, uc3;
+    scaleu.f = 1.0f / 0.693147180559945f;  /* 1/ln(2) = log2(e) */
+    uc0.f = 1.0f;
+    uc1.f = 0.692850309695840f;
+    uc2.f = 0.237504551482093f;
+    uc3.f = 0.046751431261525f;
+
+    /* Precompute HVX constant vectors */
+    HVX_Vector vzero     = Q6_V_vzero();
+    HVX_Vector voneh     = Q6_Vh_vsplat_R(0x3C00);         /* f16 1.0 */
+    HVX_Vector vneginf_h = Q6_Vh_vsplat_R(0xFC00);         /* f16 -inf */
+    HVX_Vector f0        = Q6_V_vsplat_R(uc0.i);
+    HVX_Vector f1        = Q6_V_vsplat_R(uc1.i);
+    HVX_Vector f2        = Q6_V_vsplat_R(uc2.i);
+    HVX_Vector f3        = Q6_V_vsplat_R(uc3.i);
+    HVX_Vector c7f800000 = Q6_V_vsplat_R(0x7f800000);      /* f32 exponent mask */
+    HVX_Vector c807fffff = Q6_V_vsplat_R(0x807fffff);      /* f32 sign+mantissa mask */
+    HVX_Vector vbeta     = Q6_Vqf32_vadd_VsfVsf(Q6_V_vsplat_R(scaleu.i), vzero); /* 1/ln(2) in qf32 */
+    HVX_Vector c126      = Q6_V_vsplat_R(126 << 23);
+    HVX_Vector c1w       = Q6_V_vsplat_R(1 << 23);
+    HVX_Vector c2w       = Q6_Vw_vadd_VwVw(c1w, c1w);
+    HVX_Vector c3w       = Q6_Vw_vadd_VwVw(c2w, c1w);
+    HVX_Vector c4w       = Q6_Vw_vadd_VwVw(c3w, c1w);
+    HVX_Vector c5w       = Q6_Vw_vadd_VwVw(c4w, c1w);
+
+    /* Mask: set elements [NET_OUTPUT_DIM..63] to -inf.
+     * Q6_Q_vsetq2_R(N) sets predicate bits for bytes [0..N-1].
+     * Each f16 = 2 bytes, so N = NET_OUTPUT_DIM * 2. */
+    HVX_VectorPred active_mask = Q6_Q_vsetq2_R(NET_OUTPUT_DIM * 2);
+
+    float loss_acc = 0.0f;
+    int correct_acc = 0;
+
+    for (int b = 0; b < batch_size; b++) {
+        const HVX_Vector *inp = (const HVX_Vector *)(logits + b * NET_OUTPUT_DIM_PAD);
+        HVX_Vector *outp      = (HVX_Vector *)(probs + b * NET_OUTPUT_DIM_PAD);
+
+        /* --- Load and mask --- */
+        HVX_Vector x = *inp;
+        x = Q6_V_vmux_QVV(active_mask, x, vneginf_h);
+
+        /* --- Find row max via shuffle-reduce (6 rounds for 64 f16 elements) --- */
+        HVX_Vector xmax = x;
+        {
+            int nshift = 2;  /* start at 2 bytes = 1 f16 element */
+            for (int i = 0; i < 6; i++) {
+                HVX_VectorPair temps = Q6_W_vshuff_VVR(xmax, xmax, nshift);
+                xmax = Q6_Vhf_vmax_VhfVhf(Q6_V_lo_W(temps), Q6_V_hi_W(temps));
+                nshift <<= 1;
+            }
+        }
+        /* xmax now has the row max splatted across all lanes */
+
+        /* --- Subtract max and widen to qf32 pair --- */
+        HVX_Vector xd = Q6_Vqf16_vsub_VhfVhf(x, xmax);
+        /* Widen qf16 -> two qf32 vectors (lo = elements 0..31, hi = elements 32..63) */
+        HVX_VectorPair xdiff = Q6_Wqf32_vmpy_Vqf16Vhf(xd, voneh);
+
+        /* --- Process lo half (elements 0..31 as f32) --- */
+        HVX_Vector x0 = Q6_Vqf32_vmpy_Vqf32Vqf32(Q6_V_lo_W(xdiff), vbeta);
+        x0 = Q6_Vsf_equals_Vqf32(x0);
+        /* Extract and limit exponent */
+        HVX_Vector x0exp      = Q6_V_vand_VV(x0, c7f800000);
+        HVX_Vector x0explimit = Q6_Vw_vmin_VwVw(x0exp, c126);
+        x0exp                 = Q6_Vw_vsub_VwVw(x0exp, x0explimit);
+        HVX_Vector x0norm     = Q6_V_vor_VV(Q6_V_vand_VV(c807fffff, x0), x0explimit);
+
+        /* --- Process hi half (elements 32..63 as f32) --- */
+        HVX_Vector x1 = Q6_Vqf32_vmpy_Vqf32Vqf32(Q6_V_hi_W(xdiff), vbeta);
+        x1 = Q6_Vsf_equals_Vqf32(x1);
+        HVX_Vector x1exp      = Q6_V_vand_VV(x1, c7f800000);
+        HVX_Vector x1explimit = Q6_Vw_vmin_VwVw(x1exp, c126);
+        x1exp                 = Q6_Vw_vsub_VwVw(x1exp, x1explimit);
+        HVX_Vector x1norm     = Q6_V_vor_VV(Q6_V_vand_VV(c807fffff, x1), x1explimit);
+
+        /* --- Polynomial: p = c0 + c1*m + c2*m^2 + c3*m^3  (Horner form) --- */
+        /* Lo half */
+        HVX_Vector p0 = Q6_Vqf32_vmpy_VsfVsf(x0norm, f3);
+        p0 = Q6_Vqf32_vadd_Vqf32Vsf(p0, f2);
+        x0norm = Q6_Vqf32_vadd_VsfVsf(x0norm, vzero);  /* promote to qf32 for multiply */
+        p0 = Q6_Vqf32_vmpy_Vqf32Vqf32(p0, x0norm);
+        p0 = Q6_Vqf32_vadd_Vqf32Vsf(p0, f1);
+        p0 = Q6_Vqf32_vmpy_Vqf32Vqf32(p0, x0norm);
+        p0 = Q6_Vqf32_vadd_Vqf32Vsf(p0, f0);
+
+        /* Hi half */
+        HVX_Vector p1 = Q6_Vqf32_vmpy_VsfVsf(x1norm, f3);
+        p1 = Q6_Vqf32_vadd_Vqf32Vsf(p1, f2);
+        x1norm = Q6_Vqf32_vadd_VsfVsf(x1norm, vzero);
+        p1 = Q6_Vqf32_vmpy_Vqf32Vqf32(p1, x1norm);
+        p1 = Q6_Vqf32_vadd_Vqf32Vsf(p1, f1);
+        p1 = Q6_Vqf32_vmpy_Vqf32Vqf32(p1, x1norm);
+        p1 = Q6_Vqf32_vadd_Vqf32Vsf(p1, f0);
+
+        /* --- Repeated squaring to compute 2^n --- */
+        /* Lo: p^2, p^4, ... p^64 */
+        HVX_Vector p0_2  = Q6_Vqf32_vmpy_Vqf32Vqf32(p0, p0);
+        p0_2             = Q6_Vqf32_vadd_Vqf32Vsf(p0_2, vzero);
+        HVX_Vector p0_4  = Q6_Vqf32_vmpy_Vqf32Vqf32(p0_2, p0_2);
+        p0_4             = Q6_Vqf32_vadd_Vqf32Vsf(p0_4, vzero);
+        HVX_Vector p0_8  = Q6_Vqf32_vmpy_Vqf32Vqf32(p0_4, p0_4);
+        p0_8             = Q6_Vqf32_vadd_Vqf32Vsf(p0_8, vzero);
+        HVX_Vector p0_16 = Q6_Vqf32_vmpy_Vqf32Vqf32(p0_8, p0_8);
+        p0_16            = Q6_Vqf32_vadd_Vqf32Vsf(p0_16, vzero);
+        HVX_Vector p0_32 = Q6_Vqf32_vmpy_Vqf32Vqf32(p0_16, p0_16);
+        p0_32            = Q6_Vqf32_vadd_Vqf32Vsf(p0_32, vzero);
+        HVX_Vector p0_64 = Q6_Vqf32_vmpy_Vqf32Vqf32(p0_32, p0_32);
+
+        /* Hi: p^2, p^4, ... p^64 */
+        HVX_Vector p1_2  = Q6_Vqf32_vmpy_Vqf32Vqf32(p1, p1);
+        p1_2             = Q6_Vqf32_vadd_Vqf32Vsf(p1_2, vzero);
+        HVX_Vector p1_4  = Q6_Vqf32_vmpy_Vqf32Vqf32(p1_2, p1_2);
+        p1_4             = Q6_Vqf32_vadd_Vqf32Vsf(p1_4, vzero);
+        HVX_Vector p1_8  = Q6_Vqf32_vmpy_Vqf32Vqf32(p1_4, p1_4);
+        p1_8             = Q6_Vqf32_vadd_Vqf32Vsf(p1_8, vzero);
+        HVX_Vector p1_16 = Q6_Vqf32_vmpy_Vqf32Vqf32(p1_8, p1_8);
+        p1_16            = Q6_Vqf32_vadd_Vqf32Vsf(p1_16, vzero);
+        HVX_Vector p1_32 = Q6_Vqf32_vmpy_Vqf32Vqf32(p1_16, p1_16);
+        p1_32            = Q6_Vqf32_vadd_Vqf32Vsf(p1_32, vzero);
+        HVX_Vector p1_64 = Q6_Vqf32_vmpy_Vqf32Vqf32(p1_32, p1_32);
+
+        /* --- Select correct power based on integer exponent via vmux --- */
+        HVX_VectorPred q0, q1;
+
+        q0 = Q6_Q_vcmp_eq_VwVw(x0exp, c1w);
+        q1 = Q6_Q_vcmp_eq_VwVw(x1exp, c1w);
+        p0 = Q6_V_vmux_QVV(q0, p0_2, p0);
+        p1 = Q6_V_vmux_QVV(q1, p1_2, p1);
+
+        q0 = Q6_Q_vcmp_eq_VwVw(x0exp, c2w);
+        q1 = Q6_Q_vcmp_eq_VwVw(x1exp, c2w);
+        p0 = Q6_V_vmux_QVV(q0, p0_4, p0);
+        p1 = Q6_V_vmux_QVV(q1, p1_4, p1);
+
+        q0 = Q6_Q_vcmp_eq_VwVw(x0exp, c3w);
+        q1 = Q6_Q_vcmp_eq_VwVw(x1exp, c3w);
+        p0 = Q6_V_vmux_QVV(q0, p0_8, p0);
+        p1 = Q6_V_vmux_QVV(q1, p1_8, p1);
+
+        q0 = Q6_Q_vcmp_eq_VwVw(x0exp, c4w);
+        q1 = Q6_Q_vcmp_eq_VwVw(x1exp, c4w);
+        p0 = Q6_V_vmux_QVV(q0, p0_16, p0);
+        p1 = Q6_V_vmux_QVV(q1, p1_16, p1);
+
+        q0 = Q6_Q_vcmp_eq_VwVw(x0exp, c5w);
+        q1 = Q6_Q_vcmp_eq_VwVw(x1exp, c5w);
+        p0 = Q6_V_vmux_QVV(q0, p0_32, p0);
+        p1 = Q6_V_vmux_QVV(q1, p1_32, p1);
+
+        q0 = Q6_Q_vcmp_gt_VwVw(x0exp, c5w);
+        q1 = Q6_Q_vcmp_gt_VwVw(x1exp, c5w);
+        p0 = Q6_V_vmux_QVV(q0, p0_64, p0);
+        p1 = Q6_V_vmux_QVV(q1, p1_64, p1);
+
+        /* p0, p1 now hold exp(x_scaled) in qf32 for lo and hi halves */
+
+        /* --- Sum reduction in qf32 --- */
+        /* Accumulate both halves into one vector */
+        HVX_Vector vsumf = Q6_Vqf32_vadd_Vqf32Vqf32(p0, p1);
+        {
+            int nshift = 4;  /* start at 4 bytes = 1 f32 element */
+            for (int i = 0; i < 5; i++) {
+                HVX_VectorPair temps = Q6_W_vshuff_VVR(vsumf, vsumf, nshift);
+                vsumf = Q6_Vqf32_vadd_Vqf32Vqf32(Q6_V_lo_W(temps), Q6_V_hi_W(temps));
+                nshift <<= 1;
+            }
+        }
+        vsumf = Q6_Vsf_equals_Vqf32(vsumf);
+
+        /* --- Compute reciprocal and scale --- */
+        union { float f; int32_t i; } sum_val, recip_val;
+        sum_val.i = Q6_R_vextract_VR(vsumf, 0);
+        recip_val.f = 1.0f / sum_val.f;
+        HVX_Vector vrecip = Q6_Vqf32_vadd_VsfVsf(Q6_V_vsplat_R(recip_val.i), vzero);
+
+        /* Scale: prob = exp_val * (1/sum) */
+        HVX_Vector xl = Q6_Vqf32_vmpy_Vqf32Vqf32(
+            Q6_Vqf32_vadd_Vqf32Vsf(p0, vzero), vrecip);
+        HVX_Vector xh = Q6_Vqf32_vmpy_Vqf32Vqf32(
+            Q6_Vqf32_vadd_Vqf32Vsf(p1, vzero), vrecip);
+
+        /* Pack back to f16 */
+        HVX_VectorPair scaled_pair = Q6_W_vcombine_VV(xh, xl);
+        HVX_Vector prob_h = Q6_Vhf_equals_Wqf32(scaled_pair);
+        *outp = prob_h;
+
+        /* --- Extract loss and accuracy (scalar, only 10 classes) --- */
+        uint8_t label = labels[b];
+        const uint16_t *prob_ptr = probs + b * NET_OUTPUT_DIM_PAD;
+
+        /* Cross-entropy loss: -log(prob[label]) */
+        _Float16 p_correct_h;
+        memcpy(&p_correct_h, &prob_ptr[label], sizeof(uint16_t));
+        float p_correct = (float)p_correct_h;
+        if (p_correct < 1e-7f) p_correct = 1e-7f;
+        loss_acc -= fast_logf(p_correct);
+
+        /* Argmax for accuracy */
+        int argmax = 0;
+        _Float16 max_p;
+        memcpy(&max_p, &prob_ptr[0], sizeof(uint16_t));
+        for (int j = 1; j < NET_OUTPUT_DIM; j++) {
+            _Float16 pj;
+            memcpy(&pj, &prob_ptr[j], sizeof(uint16_t));
+            if (pj > max_p) {
+                max_p = pj;
+                argmax = j;
+            }
+        }
+        if (argmax == (int)label) correct_acc++;
+    }
+
+    *total_loss = loss_acc / (float)batch_size;
+    *total_correct = correct_acc;
+}
+
 #endif /* HVX_OPS_F16_H */

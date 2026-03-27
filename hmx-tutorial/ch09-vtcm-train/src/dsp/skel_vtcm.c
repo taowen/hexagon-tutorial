@@ -1,10 +1,18 @@
 /*
- * ch09: dspqueue + VTCM-resident training skel
+ * ch09: dspqueue + VTCM-resident f16 training skel (HVX widening multiply)
  *
- * Variant of ch08's skel_fused.c that mirrors all network buffers into VTCM.
- * The dspqueue callback thread keeps VTCM alive between messages, so weights
- * stay resident across batches. Only input is copied from DDR per batch;
- * weights are synced back to DDR on OP_SYNC.
+ * All network data (weights, activations, gradients) stored as f16 in VTCM.
+ * Matrix multiplications use HVX widening multiply (Q6_Wqf32_vmpy_Vqf16Vhf)
+ * for qf32 internal accumulation directly from f16 operands -- no scalar
+ * f16<->f32 conversion, no DDR scratch buffers.
+ *
+ * All non-matmul ops use HVX vectorized functions directly on VTCM data
+ * (128B-aligned rows, NET_OUTPUT_DIM_PAD=64 = 1 HVX vector per row).
+ *
+ * ARM sends f16 input directly (no f32->f16 conversion on DSP).
+ *
+ * VTCM layout:
+ *   [f16 data buffers (~800KB)]
  */
 
 #include <stdlib.h>
@@ -12,49 +20,60 @@
 
 #include "dsp/skel_common.h"
 #include "dsp/hvx_ops.h"
+#include "dsp/hvx_ops_f16.h"
+#include "dsp/hvx_matmul_f16_vtcm.h"
+#include "hexkl_micro.h"
 #include "common/protocol.h"
 
-#include "HAP_compute_res.h"
 
-#define USE_VTCM_SCRATCH
-#include "dsp/hvx_matmul_vtcm.h"
+/* ---------- Buffer sizes (f16 bytes) ---------- */
+#define W1_F16   (NET_HIDDEN_DIM * NET_INPUT_DIM_PAD * 2)     /* 200KB */
+#define B1_F16   (NET_HIDDEN_DIM * 2)                          /* 256B  */
+#define W2_F16   (NET_OUTPUT_DIM_PAD * NET_HIDDEN_DIM * 2)     /* 16KB  */
+#define B2_F16   (NET_OUTPUT_DIM_PAD * 2)                      /* 128B  */
+#define DW1_F16  W1_F16
+#define DW2_F16  W2_F16
+#define MAX_BATCH 256
 
-/* ---------- HVX copy: VTCM→DDR without L2 pollution ----------
- *
- * memcpy() uses scalar loads which pull VTCM addresses into L2 cache.
- * Subsequent HVX writes to VTCM bypass L2, creating stale entries.
- * HVX vector loads from VTCM go through the direct VTCM port (not L2),
- * so using HVX to copy avoids the pollution entirely.
- * See ch10 README for the full VTCM resource preemption analysis.
- */
-static void hvx_copy(void *dst, const void *src, uint32_t bytes) {
-    uint32_t n_vecs = bytes / 128;
+#define HIDDEN_F16(bs)  ((bs) * NET_HIDDEN_DIM * 2)
+#define LOGITS_F16(bs)  ((bs) * NET_OUTPUT_DIM_PAD * 2)
+#define INPUT_F16(bs)   ((bs) * NET_INPUT_DIM_PAD * 2)
+
+
+/* ---------- HVX helpers for VTCM access ---------- */
+
+/* HVX vector copy: dst and src both in VTCM (or any HVX-accessible memory) */
+static void hvx_memcpy(void *dst, const void *src, uint32_t bytes) {
+    uint32_t vecs = bytes / 128;
     const HVX_Vector *s = (const HVX_Vector *)src;
     HVX_Vector *d = (HVX_Vector *)dst;
-    for (uint32_t i = 0; i < n_vecs; i++) {
+    for (uint32_t i = 0; i < vecs; i++)
         d[i] = s[i];
-    }
-    /* Handle remainder (< 128 bytes) with scalar copy */
-    uint32_t done = n_vecs * 128;
-    if (done < bytes) {
-        memcpy((uint8_t *)dst + done, (const uint8_t *)src + done, bytes - done);
+    /* Tail bytes (should not happen with 128-byte aligned VTCM allocations) */
+    uint32_t rem = bytes & 127;
+    if (rem) {
+        uint8_t *db = (uint8_t *)dst + vecs * 128;
+        const uint8_t *sb = (const uint8_t *)src + vecs * 128;
+        for (uint32_t i = 0; i < rem; i++)
+            db[i] = sb[i];
     }
 }
 
-/* ---------- Buffer sizes (bytes) ---------- */
-#define W1_BYTES   (NET_HIDDEN_DIM * NET_INPUT_DIM_PAD * 4)   /* 400KB */
-#define B1_BYTES   (NET_HIDDEN_DIM * 4)                        /* 512B  */
-#define W2_BYTES   (NET_OUTPUT_DIM_PAD * NET_HIDDEN_DIM * 4)   /* 16KB  */
-#define B2_BYTES   (NET_OUTPUT_DIM_PAD * 4)                    /* 128B  */
-#define DW1_BYTES  W1_BYTES
-#define DW2_BYTES  W2_BYTES
-#define MAX_BATCH  256
+/* HVX zero-fill: VTCM-safe */
+static void hvx_memzero(void *dst, uint32_t bytes) {
+    uint32_t vecs = bytes / 128;
+    HVX_Vector *d = (HVX_Vector *)dst;
+    HVX_Vector zero = Q6_V_vzero();
+    for (uint32_t i = 0; i < vecs; i++)
+        d[i] = zero;
+    uint32_t rem = bytes & 127;
+    if (rem) {
+        uint8_t *db = (uint8_t *)dst + vecs * 128;
+        for (uint32_t i = 0; i < rem; i++)
+            db[i] = 0;
+    }
+}
 
-#define HIDDEN_BYTES(bs)  ((bs) * NET_HIDDEN_DIM * 4)
-#define LOGITS_BYTES(bs)  ((bs) * NET_OUTPUT_DIM_PAD * 4)
-#define INPUT_BYTES(bs)   ((bs) * NET_INPUT_DIM_PAD * 4)
-
-#define SCRATCH_BYTES     (128 * 800 * 4)
 
 
 /* ---------- DSP context ---------- */
@@ -62,33 +81,33 @@ struct mnist_context {
     dspqueue_t queue;
     uint64_t process_time, time_fwd_mm, time_fwd_other, time_bwd_mm, time_bwd_other, time_sgd;
 
-    /* DDR pointers from OP_REGISTER_NET */
+    /* DDR pointers from OP_REGISTER_NET (f32) */
     float *net_bufs[NET_BUF_COUNT];
     int    net_fds[NET_BUF_COUNT];
     int    net_registered;
 
     /* VTCM state */
-    unsigned int vtcm_res_id;
-    void        *vtcm_base;
-    uint32_t     vtcm_size;
+    uint8_t *vtcm_base;
+    uint32_t vtcm_size;
 
-    /* VTCM mirror buffers (bump-allocated from vtcm_base) */
-    float *v_w1, *v_b1, *v_w2, *v_b2;        /* weights        */
-    float *v_dw1, *v_dw2;                      /* gradients      */
-    float *v_hidden, *v_logits;                /* fwd activations */
-    float *v_dhidden, *v_dlogits;              /* bwd gradients  */
-    float *v_hidden_pre, *v_probs;             /* intermediates  */
-    float *v_input;                            /* per-batch input */
-    float *v_scratch;                          /* matmul scratch  */
-    int    vtcm_ready;
+    /* VTCM f16 data buffers (bump-allocated from vtcm_base) */
+    _Float16 *v_b1, *v_b2;                      /* biases           */
+    _Float16 *v_w1_t, *v_w2_t;                  /* transposed weights (primary) */
+    _Float16 *v_dw1_t, *v_dw2_t;                /* gradients (transposed form) */
+    _Float16 *v_hidden, *v_logits;               /* fwd activations  */
+    _Float16 *v_dlogits, *v_probs;               /* fwd intermediates */
+    _Float16 *v_hidden_pre, *v_dhidden;          /* bwd intermediates */
+    _Float16 *v_input;                           /* per-batch input   */
+
+    int vtcm_ready;
 };
 
 
 /* ---------- Bump allocator (128-byte aligned) ---------- */
-static float *bump_alloc(uint8_t **bump, uint32_t bytes) {
+static _Float16 *bump_alloc_f16(uint8_t **bump, uint32_t bytes) {
     uintptr_t addr = (uintptr_t)*bump;
     addr = (addr + 127) & ~(uintptr_t)127;
-    float *ptr = (float *)addr;
+    _Float16 *ptr = (_Float16 *)addr;
     *bump = (uint8_t *)(addr + bytes);
     return ptr;
 }
@@ -104,83 +123,216 @@ AEEResult mnist_train_close(remote_handle64 handle) {
     struct mnist_context *ctx = (struct mnist_context *)handle;
     if (!ctx) return AEE_EBADPARM;
     if (ctx->queue) return AEE_EITEMBUSY;
-
-    if (ctx->vtcm_res_id) {
-        HAP_compute_res_release(ctx->vtcm_res_id);
-        ctx->vtcm_res_id = 0;
-        FARF(HIGH, "VTCM released in close");
-    }
-
     free(ctx);
     return AEE_SUCCESS;
 }
 
 
-/* ========== VTCM acquisition and buffer layout ========== */
+/* ========== VTCM setup: allocate f16 data buffers ========== */
 
-static int acquire_vtcm_and_populate(struct mnist_context *ctx) {
-#ifdef USE_HEAP_MIRROR
-    /* Heap fallback for debugging */
-    ctx->vtcm_base = memalign(4096, 4 * 1024 * 1024);
-    if (!ctx->vtcm_base) {
-        FARF(ERROR, "Heap alloc failed (4MB)");
-        return AEE_ENOMEMORY;
+static int setup_vtcm(struct mnist_context *ctx) {
+    /* hexkl_micro_hw_init acquires VTCM */
+    int err = hexkl_micro_hw_init(&ctx->vtcm_base, &ctx->vtcm_size);
+    if (err != AEE_SUCCESS) {
+        FARF(ERROR, "hexkl_micro_hw_init failed: 0x%08x", (unsigned)err);
+        return err;
     }
-    ctx->vtcm_size = 4 * 1024 * 1024;
-    ctx->vtcm_res_id = 0;
-    FARF(HIGH, "HEAP mirror: %u KB at %p", ctx->vtcm_size / 1024, ctx->vtcm_base);
-#else
-    /* Request 4MB VTCM */
-    compute_res_attr_t attr;
-    HAP_compute_res_attr_init(&attr);
-    HAP_compute_res_attr_set_vtcm_param(&attr, 4 * 1024 * 1024, 1);
-
-    ctx->vtcm_res_id = HAP_compute_res_acquire(&attr, 100000);
-    if (!ctx->vtcm_res_id) {
-        FARF(ERROR, "VTCM acquire failed (4MB)");
-        return AEE_ENOMEMORY;
-    }
-    ctx->vtcm_base = HAP_compute_res_attr_get_vtcm_ptr(&attr);
-    ctx->vtcm_size = 4 * 1024 * 1024;
     FARF(HIGH, "VTCM acquired: %u KB at %p", ctx->vtcm_size / 1024, ctx->vtcm_base);
-#endif
 
-    /* Bump-allocate all buffers */
-    uint8_t *bump = (uint8_t *)ctx->vtcm_base;
-    ctx->v_w1         = bump_alloc(&bump, W1_BYTES);
-    ctx->v_b1         = bump_alloc(&bump, B1_BYTES);
-    ctx->v_w2         = bump_alloc(&bump, W2_BYTES);
-    ctx->v_b2         = bump_alloc(&bump, B2_BYTES);
-    ctx->v_dw1        = bump_alloc(&bump, DW1_BYTES);
-    ctx->v_dw2        = bump_alloc(&bump, DW2_BYTES);
-    ctx->v_hidden     = bump_alloc(&bump, HIDDEN_BYTES(MAX_BATCH));
-    ctx->v_logits     = bump_alloc(&bump, LOGITS_BYTES(MAX_BATCH));
-    ctx->v_dhidden    = bump_alloc(&bump, HIDDEN_BYTES(MAX_BATCH));
-    ctx->v_dlogits    = bump_alloc(&bump, LOGITS_BYTES(MAX_BATCH));
-    ctx->v_hidden_pre = bump_alloc(&bump, HIDDEN_BYTES(MAX_BATCH));
-    ctx->v_probs      = bump_alloc(&bump, LOGITS_BYTES(MAX_BATCH));
-    ctx->v_input      = bump_alloc(&bump, INPUT_BYTES(MAX_BATCH));
-    ctx->v_scratch    = bump_alloc(&bump, SCRATCH_BYTES);
+    /* Bump-allocate f16 data buffers from front of VTCM.
+     * Only transposed weights are stored (no v_w1/v_w2). */
+    uint8_t *bump = ctx->vtcm_base;
+    ctx->v_b1         = bump_alloc_f16(&bump, B1_F16);
+    ctx->v_b2         = bump_alloc_f16(&bump, B2_F16);
+    ctx->v_w1_t       = bump_alloc_f16(&bump, W1_F16);    /* W1^T[832,128] */
+    ctx->v_w2_t       = bump_alloc_f16(&bump, W2_F16);    /* W2^T[128,64]  */
+    ctx->v_dw1_t      = bump_alloc_f16(&bump, W1_F16);    /* dW1^T[832,128] */
+    ctx->v_dw2_t      = bump_alloc_f16(&bump, DW2_F16);   /* dW2^T[128,64]  */
+    ctx->v_hidden     = bump_alloc_f16(&bump, HIDDEN_F16(MAX_BATCH));
+    ctx->v_logits     = bump_alloc_f16(&bump, LOGITS_F16(MAX_BATCH));
+    ctx->v_dlogits    = bump_alloc_f16(&bump, LOGITS_F16(MAX_BATCH));
+    ctx->v_probs      = bump_alloc_f16(&bump, LOGITS_F16(MAX_BATCH));
+    ctx->v_hidden_pre = bump_alloc_f16(&bump, HIDDEN_F16(MAX_BATCH));
+    ctx->v_dhidden    = bump_alloc_f16(&bump, HIDDEN_F16(MAX_BATCH));
+    ctx->v_input      = bump_alloc_f16(&bump, INPUT_F16(MAX_BATCH));
 
-    /* Scratch is in VTCM too. The L2 coherency issue (scalar reads
-     * seeing stale L2 entries after HVX writes) is solved by using
-     * hvx_copy() in OP_SYNC instead of memcpy. */
-    g_scratch = ctx->v_scratch;
+    uint32_t data_used = (uint32_t)((uintptr_t)bump - (uintptr_t)ctx->vtcm_base);
+    FARF(HIGH, "VTCM layout: data=%uKB, total=%uKB",
+         data_used / 1024, ctx->vtcm_size / 1024);
 
-    uint32_t used = (uint32_t)((uintptr_t)bump - (uintptr_t)ctx->vtcm_base);
-    FARF(HIGH, "VTCM bump: %u KB used / %u KB allocated",
-         used / 1024, ctx->vtcm_size / 1024);
+    /* Convert f32 weights from DDR to f16, then transpose to VTCM.
+     * Use v_dw1_t as temp buffer for the non-transposed f16 weights. */
+    hvx_f32_to_f16(ctx->v_dw1_t, ctx->net_bufs[NET_BUF_W1],
+                    NET_HIDDEN_DIM * NET_INPUT_DIM_PAD);
+    blocked_transpose_f16_vtcm(ctx->v_w1_t, ctx->v_dw1_t,
+                           NET_HIDDEN_DIM, NET_INPUT_DIM_PAD);
 
-    /* Copy weights from DDR to VTCM */
-    memcpy(ctx->v_w1, ctx->net_bufs[NET_BUF_W1], W1_BYTES);
-    memcpy(ctx->v_b1, ctx->net_bufs[NET_BUF_B1], B1_BYTES);
-    memcpy(ctx->v_w2, ctx->net_bufs[NET_BUF_W2], W2_BYTES);
-    memcpy(ctx->v_b2, ctx->net_bufs[NET_BUF_B2], B2_BYTES);
-    FARF(HIGH, "Weights copied DDR -> VTCM (W1=%uKB B1=%uB W2=%uKB B2=%uB)",
-         W1_BYTES / 1024, B1_BYTES, W2_BYTES / 1024, B2_BYTES);
+    hvx_f32_to_f16(ctx->v_dw2_t, ctx->net_bufs[NET_BUF_W2],
+                    NET_OUTPUT_DIM_PAD * NET_HIDDEN_DIM);
+    blocked_transpose_f16_vtcm(ctx->v_w2_t, ctx->v_dw2_t,
+                           NET_OUTPUT_DIM_PAD, NET_HIDDEN_DIM);
+
+    hvx_f32_to_f16(ctx->v_b1, ctx->net_bufs[NET_BUF_B1], NET_HIDDEN_DIM);
+    hvx_f32_to_f16(ctx->v_b2, ctx->net_bufs[NET_BUF_B2], NET_OUTPUT_DIM_PAD);
+
+    FARF(HIGH, "Weights: f32 DDR -> f16 transposed VTCM (%uKB)",
+         (W1_F16 + W2_F16) / 1024);
 
     ctx->vtcm_ready = 1;
     return AEE_SUCCESS;
+}
+
+
+/* ========== Training/eval helper functions ========== */
+
+/*
+ * do_train_batch -- Execute one forward+backward+SGD step on a batch
+ *                   already loaded into ctx->v_input.
+ *
+ * Returns batch loss in *out_loss, batch correct count in *out_correct.
+ * Labels are read from the labels array (batch_size elements).
+ */
+static void do_train_batch(struct mnist_context *ctx,
+                           const uint8_t *labels, uint32_t bs, float lr,
+                           float *out_loss, uint32_t *out_correct)
+{
+    _Float16 *inp     = ctx->v_input;
+    _Float16 *b1      = ctx->v_b1;
+    _Float16 *b2      = ctx->v_b2;
+    _Float16 *w1_t    = ctx->v_w1_t;
+    _Float16 *w2_t    = ctx->v_w2_t;
+    _Float16 *dw1_t   = ctx->v_dw1_t;
+    _Float16 *dw2_t   = ctx->v_dw2_t;
+    _Float16 *hidden  = ctx->v_hidden;
+    _Float16 *logits  = ctx->v_logits;
+    _Float16 *dlogits = ctx->v_dlogits;
+    _Float16 *probs   = ctx->v_probs;
+    _Float16 *hidden_pre = ctx->v_hidden_pre;
+    _Float16 *dhidden = ctx->v_dhidden;
+
+    uint64_t t1 = HAP_perf_get_time_us();
+    uint64_t t_phase;
+
+    /* === FORWARD === */
+    t_phase = HAP_perf_get_time_us();
+    matmul_nn_f16_2x(hidden, inp, w1_t,
+                     bs, NET_HIDDEN_DIM, NET_INPUT_DIM_PAD);
+    ctx->time_fwd_mm += (HAP_perf_get_time_us() - t_phase);
+
+    t_phase = HAP_perf_get_time_us();
+    hvx_add_bias_f16(hidden, b1, bs, NET_HIDDEN_DIM);
+    hvx_memcpy(hidden_pre, hidden, bs * NET_HIDDEN_DIM * sizeof(_Float16));
+    hvx_relu_forward_f16(hidden, hidden, bs * NET_HIDDEN_DIM);
+    ctx->time_fwd_other += (HAP_perf_get_time_us() - t_phase);
+
+    t_phase = HAP_perf_get_time_us();
+    matmul_nn_f16(logits, hidden, w2_t,
+                  bs, NET_OUTPUT_DIM_PAD, NET_HIDDEN_DIM);
+    ctx->time_fwd_mm += (HAP_perf_get_time_us() - t_phase);
+
+    t_phase = HAP_perf_get_time_us();
+    hvx_add_bias_f16(logits, b2, bs, NET_OUTPUT_DIM_PAD);
+
+    float loss = 0.0f;
+    int correct_i = 0;
+    hvx_softmax_cross_entropy_f16_vec((const uint16_t *)logits,
+        (uint16_t *)probs, labels, bs, &loss, &correct_i);
+    ctx->time_fwd_other += (HAP_perf_get_time_us() - t_phase);
+
+    /* === BACKWARD === */
+    t_phase = HAP_perf_get_time_us();
+    hvx_memcpy(dlogits, probs, bs * NET_OUTPUT_DIM_PAD * sizeof(_Float16));
+    {
+        _Float16 inv_batch_h = (_Float16)(1.0f / (float)bs);
+        uint16_t inv_bits;
+        memcpy(&inv_bits, &inv_batch_h, sizeof(inv_bits));
+        HVX_Vector inv_vec = Q6_Vh_vsplat_R((int32_t)inv_bits);
+        for (uint32_t i = 0; i < bs; i++) {
+            _Float16 *row = dlogits + i * NET_OUTPUT_DIM_PAD;
+            row[labels[i]] = (_Float16)((float)row[labels[i]] - 1.0f);
+            HVX_Vector v = *(HVX_Vector *)row;
+            HVX_Vector vq = Q6_Vqf16_vmpy_VhfVhf(v, inv_vec);
+            *(HVX_Vector *)row = Q6_Vhf_equals_Vqf16(vq);
+        }
+    }
+    ctx->time_bwd_other += (HAP_perf_get_time_us() - t_phase);
+
+    t_phase = HAP_perf_get_time_us();
+    hvx_memzero(dw2_t, NET_HIDDEN_DIM * NET_OUTPUT_DIM_PAD * sizeof(_Float16));
+    matmul_tn_f16(dw2_t, hidden, dlogits,
+                   NET_HIDDEN_DIM, NET_OUTPUT_DIM_PAD, bs);
+    ctx->time_bwd_mm += (HAP_perf_get_time_us() - t_phase);
+
+    t_phase = HAP_perf_get_time_us();
+    _Float16 db2_local[NET_OUTPUT_DIM_PAD] __attribute__((aligned(128)));
+    hvx_bias_backward_f16(db2_local, dlogits, bs, NET_OUTPUT_DIM_PAD);
+    ctx->time_bwd_other += (HAP_perf_get_time_us() - t_phase);
+
+    t_phase = HAP_perf_get_time_us();
+    matmul_nt_f16(dhidden, dlogits, w2_t,
+                  bs, NET_HIDDEN_DIM, NET_OUTPUT_DIM_PAD);
+    ctx->time_bwd_mm += (HAP_perf_get_time_us() - t_phase);
+
+    t_phase = HAP_perf_get_time_us();
+    hvx_relu_backward_f16(dhidden, dhidden, hidden_pre,
+        bs * NET_HIDDEN_DIM);
+    ctx->time_bwd_other += (HAP_perf_get_time_us() - t_phase);
+
+    t_phase = HAP_perf_get_time_us();
+    hvx_memzero(dw1_t, NET_INPUT_DIM_PAD * NET_HIDDEN_DIM * sizeof(_Float16));
+    matmul_tn_f16(dw1_t, inp, dhidden,
+                   NET_INPUT_DIM_PAD, NET_HIDDEN_DIM, bs);
+    ctx->time_bwd_mm += (HAP_perf_get_time_us() - t_phase);
+
+    t_phase = HAP_perf_get_time_us();
+    _Float16 db1_local[NET_HIDDEN_DIM] __attribute__((aligned(128)));
+    hvx_bias_backward_f16(db1_local, dhidden, bs, NET_HIDDEN_DIM);
+    ctx->time_bwd_other += (HAP_perf_get_time_us() - t_phase);
+
+    /* === SGD UPDATE === */
+    uint64_t t_sgd = HAP_perf_get_time_us();
+    hvx_sgd_update_f16(w1_t, dw1_t, lr, NET_INPUT_DIM_PAD * NET_HIDDEN_DIM);
+    hvx_sgd_update_f16(b1, db1_local, lr, NET_HIDDEN_DIM);
+    hvx_sgd_update_f16(w2_t, dw2_t, lr, NET_HIDDEN_DIM * NET_OUTPUT_DIM_PAD);
+    hvx_sgd_update_f16(b2, db2_local, lr, NET_OUTPUT_DIM_PAD);
+    ctx->time_sgd += (HAP_perf_get_time_us() - t_sgd);
+
+    ctx->process_time += (HAP_perf_get_time_us() - t1);
+
+    *out_loss = loss;
+    *out_correct = (uint32_t)correct_i;
+}
+
+/*
+ * do_eval_batch -- Forward pass only on a batch already loaded into ctx->v_input.
+ *
+ * Returns number of correct predictions.
+ */
+static uint32_t do_eval_batch(struct mnist_context *ctx,
+                              const uint8_t *labels, uint32_t bs)
+{
+    /* Forward pass using widening multiply matmul */
+    matmul_nn_f16_2x(ctx->v_hidden, ctx->v_input, ctx->v_w1_t,
+                     bs, NET_HIDDEN_DIM, NET_INPUT_DIM_PAD);
+    hvx_add_bias_f16(ctx->v_hidden, ctx->v_b1, bs, NET_HIDDEN_DIM);
+    hvx_relu_forward_f16(ctx->v_hidden, ctx->v_hidden, bs * NET_HIDDEN_DIM);
+
+    matmul_nn_f16(ctx->v_logits, ctx->v_hidden, ctx->v_w2_t,
+                  bs, NET_OUTPUT_DIM_PAD, NET_HIDDEN_DIM);
+    hvx_add_bias_f16(ctx->v_logits, ctx->v_b2, bs, NET_OUTPUT_DIM_PAD);
+
+    /* Count correct predictions */
+    uint32_t correct = 0;
+    for (uint32_t i = 0; i < bs; i++) {
+        const _Float16 *row = ctx->v_logits + i * NET_OUTPUT_DIM_PAD;
+        _Float16 max_val = row[0];
+        int max_j = 0;
+        for (int j = 1; j < NET_OUTPUT_DIM; j++) {
+            if (row[j] > max_val) { max_val = row[j]; max_j = j; }
+        }
+        if (max_j == labels[i]) correct++;
+    }
+    return correct;
 }
 
 
@@ -191,9 +343,10 @@ static void packet_callback(dspqueue_t queue, int error, void *context) {
 
     while (1) {
         union {
-            struct register_net_req reg;
-            struct train_batch_req  train;
-            struct sync_req         sync;
+            struct register_net_req  reg;
+            struct train_batch_req   train;
+            struct sync_req          sync;
+            struct train_all_req     train_all;
         } msg;
         uint32_t flags, msg_len, n_bufs;
         struct dspqueue_buffer bufs[MATMUL_MAX_BUFFERS];
@@ -210,30 +363,26 @@ static void packet_callback(dspqueue_t queue, int error, void *context) {
         uint32_t op = msg.reg.op;
 
         if (op == OP_REGISTER_NET && n_bufs >= NET_BUF_COUNT) {
-            /* Store DDR buffer pointers and fds */
+            /* Store DDR buffer pointers (f32) */
             for (int i = 0; i < NET_BUF_COUNT; i++) {
                 ctx->net_bufs[i] = (float *)bufs[i].ptr;
                 ctx->net_fds[i] = bufs[i].fd;
             }
             ctx->net_registered = 1;
 
-            /* Acquire VTCM and copy weights */
-            int vtcm_err = acquire_vtcm_and_populate(ctx);
-            if (vtcm_err != AEE_SUCCESS) {
-                FARF(ERROR, "VTCM setup failed: 0x%08x", (unsigned)vtcm_err);
-            }
+            /* Setup VTCM + convert weights */
+            int setup_err = setup_vtcm(ctx);
 
             FARF(HIGH, "Network registered (%d bufs), VTCM %s",
                  NET_BUF_COUNT, ctx->vtcm_ready ? "ready" : "FAILED");
 
-            /* Response: deref all buffers */
             struct dspqueue_buffer rsp_bufs[NET_BUF_COUNT];
             memset(rsp_bufs, 0, sizeof(rsp_bufs));
             for (int i = 0; i < NET_BUF_COUNT; i++) {
                 rsp_bufs[i].fd = bufs[i].fd;
                 rsp_bufs[i].flags = DSPQUEUE_BUFFER_FLAG_DEREF;
             }
-            struct matmul_rsp rsp = { OP_REGISTER_NET, (uint32_t)vtcm_err };
+            struct matmul_rsp rsp = { OP_REGISTER_NET, (uint32_t)setup_err };
             dspqueue_write(queue, 0, NET_BUF_COUNT, rsp_bufs,
                            sizeof(rsp), (const uint8_t *)&rsp,
                            DSPQUEUE_TIMEOUT_NONE);
@@ -243,115 +392,15 @@ static void packet_callback(dspqueue_t queue, int error, void *context) {
             uint32_t bs = treq->batch_size;
             float lr = treq->learning_rate;
 
-            /* Copy input from DDR to VTCM */
-            memcpy(ctx->v_input, (float *)bufs[0].ptr, bs * NET_INPUT_DIM_PAD * sizeof(float));
+            /* Copy f16 input from DDR to VTCM via HVX bulk load */
+            hvx_memcpy(ctx->v_input, bufs[0].ptr,
+                       bs * NET_INPUT_DIM_PAD * sizeof(_Float16));
 
-            /* All pointers are VTCM */
-            float *inp        = ctx->v_input;
-            float *w1         = ctx->v_w1;
-            float *b1         = ctx->v_b1;
-            float *w2         = ctx->v_w2;
-            float *b2         = ctx->v_b2;
-            float *dw1        = ctx->v_dw1;
-            float *dw2        = ctx->v_dw2;
-            float *hidden     = ctx->v_hidden;
-            float *logits     = ctx->v_logits;
-            float *dhidden    = ctx->v_dhidden;
-            float *dlogits    = ctx->v_dlogits;
-            float *hidden_pre = ctx->v_hidden_pre;
-            float *probs      = ctx->v_probs;
-
-            uint64_t t1 = HAP_perf_get_time_us();
-            uint64_t t_phase;
-
-            /* === FORWARD === */
-            /* Layer 1: hidden = input @ W1^T + b1 */
-            t_phase = HAP_perf_get_time_us();
-            matmul_nt(hidden, inp, w1, bs, NET_HIDDEN_DIM, NET_INPUT_DIM_PAD);
-            ctx->time_fwd_mm += (HAP_perf_get_time_us() - t_phase);
-
-            t_phase = HAP_perf_get_time_us();
-            hvx_add_bias(hidden, b1, bs, NET_HIDDEN_DIM);
-            memcpy(hidden_pre, hidden, bs * NET_HIDDEN_DIM * sizeof(float));
-            hvx_relu_forward(hidden, bs * NET_HIDDEN_DIM);
-            ctx->time_fwd_other += (HAP_perf_get_time_us() - t_phase);
-
-            /* Layer 2: logits = hidden @ W2^T + b2 */
-            t_phase = HAP_perf_get_time_us();
-            matmul_nt(logits, hidden, w2, bs, NET_OUTPUT_DIM_PAD, NET_HIDDEN_DIM);
-            ctx->time_fwd_mm += (HAP_perf_get_time_us() - t_phase);
-
-            t_phase = HAP_perf_get_time_us();
-            hvx_add_bias(logits, b2, bs, NET_OUTPUT_DIM_PAD);
-
-            /* Softmax + cross-entropy loss */
-            float loss = hvx_softmax_cross_entropy(logits, treq->labels, probs, bs);
-
-            /* Training accuracy */
+            float loss = 0.0f;
             uint32_t correct = 0;
-            for (uint32_t b_idx = 0; b_idx < bs; b_idx++) {
-                const float *row = logits + b_idx * NET_OUTPUT_DIM_PAD;
-                float max_val = row[0];
-                int max_j = 0;
-                for (int j = 1; j < NET_OUTPUT_DIM; j++) {
-                    if (row[j] > max_val) { max_val = row[j]; max_j = j; }
-                }
-                if (max_j == treq->labels[b_idx]) correct++;
-            }
-            ctx->time_fwd_other += (HAP_perf_get_time_us() - t_phase);
+            do_train_batch(ctx, treq->labels, bs, lr, &loss, &correct);
 
-            /* === BACKWARD === */
-            /* dlogits = (probs - one_hot) / batch */
-            t_phase = HAP_perf_get_time_us();
-            hvx_compute_dlogits(dlogits, probs, treq->labels, bs);
-            ctx->time_bwd_other += (HAP_perf_get_time_us() - t_phase);
-
-            /* dW2 = dlogits^T @ hidden */
-            t_phase = HAP_perf_get_time_us();
-            matmul_tn(dw2, dlogits, hidden, NET_OUTPUT_DIM_PAD, NET_HIDDEN_DIM, bs);
-            ctx->time_bwd_mm += (HAP_perf_get_time_us() - t_phase);
-
-            /* db2 = sum_rows(dlogits) */
-            t_phase = HAP_perf_get_time_us();
-            float db2_local[NET_OUTPUT_DIM_PAD] __attribute__((aligned(128)));
-            hvx_bias_backward(db2_local, dlogits, bs, NET_OUTPUT_DIM_PAD);
-            ctx->time_bwd_other += (HAP_perf_get_time_us() - t_phase);
-
-            /* dhidden = dlogits @ W2 */
-            t_phase = HAP_perf_get_time_us();
-            matmul_nn(dhidden, dlogits, w2, bs, NET_HIDDEN_DIM, NET_OUTPUT_DIM_PAD);
-            ctx->time_bwd_mm += (HAP_perf_get_time_us() - t_phase);
-
-            /* ReLU backward */
-            t_phase = HAP_perf_get_time_us();
-            hvx_relu_backward(dhidden, hidden_pre, bs * NET_HIDDEN_DIM);
-            ctx->time_bwd_other += (HAP_perf_get_time_us() - t_phase);
-
-            /* dW1 = dhidden^T @ input */
-            t_phase = HAP_perf_get_time_us();
-            matmul_tn(dw1, dhidden, inp, NET_HIDDEN_DIM, NET_INPUT_DIM_PAD, bs);
-            ctx->time_bwd_mm += (HAP_perf_get_time_us() - t_phase);
-
-            /* db1 = sum_rows(dhidden) */
-            t_phase = HAP_perf_get_time_us();
-            float db1_local[NET_HIDDEN_DIM] __attribute__((aligned(128)));
-            hvx_bias_backward(db1_local, dhidden, bs, NET_HIDDEN_DIM);
-            ctx->time_bwd_other += (HAP_perf_get_time_us() - t_phase);
-
-            /* === SGD UPDATE (in VTCM) === */
-            uint64_t t_sgd = HAP_perf_get_time_us();
-            hvx_sgd_update(w1, dw1, lr, NET_HIDDEN_DIM * NET_INPUT_DIM_PAD);
-            for (int i = 0; i < NET_HIDDEN_DIM; i++)
-                b1[i] -= lr * db1_local[i];
-            hvx_sgd_update(w2, dw2, lr, NET_OUTPUT_DIM_PAD * NET_HIDDEN_DIM);
-            for (int i = 0; i < NET_OUTPUT_DIM_PAD; i++)
-                b2[i] -= lr * db2_local[i];
-            ctx->time_sgd += (HAP_perf_get_time_us() - t_sgd);
-
-            uint64_t t2 = HAP_perf_get_time_us();
-            ctx->process_time += (t2 - t1);
-
-            /* Response: deref input buffer, return loss + accuracy */
+            /* Response */
             struct train_batch_rsp rsp;
             rsp.op = OP_TRAIN_BATCH;
             rsp.status = 0;
@@ -367,44 +416,23 @@ static void packet_callback(dspqueue_t queue, int error, void *context) {
                            sizeof(rsp), (const uint8_t *)&rsp,
                            DSPQUEUE_TIMEOUT_NONE);
 
-        } else if (op == 5 /* OP_EVAL */ && ctx->vtcm_ready) {
+        } else if (op == OP_EVAL && ctx->vtcm_ready) {
             struct train_batch_req *treq = &msg.train;
             uint32_t bs = treq->batch_size;
 
-            /* Copy test input from DDR to VTCM */
-            memcpy(ctx->v_input, (float *)bufs[0].ptr, bs * NET_INPUT_DIM_PAD * sizeof(float));
+            /* Copy f16 test input from DDR to VTCM via HVX bulk load */
+            hvx_memcpy(ctx->v_input, bufs[0].ptr,
+                       bs * NET_INPUT_DIM_PAD * sizeof(_Float16));
 
-            /* Forward pass only (using VTCM weights) */
-            float *inp    = ctx->v_input;
-            float *hidden = ctx->v_hidden;
-            float *logits = ctx->v_logits;
+            uint32_t correct = do_eval_batch(ctx, treq->labels, bs);
 
-            matmul_nt(hidden, inp, ctx->v_w1, bs, NET_HIDDEN_DIM, NET_INPUT_DIM_PAD);
-            hvx_add_bias(hidden, ctx->v_b1, bs, NET_HIDDEN_DIM);
-            hvx_relu_forward(hidden, bs * NET_HIDDEN_DIM);
-            matmul_nt(logits, hidden, ctx->v_w2, bs, NET_OUTPUT_DIM_PAD, NET_HIDDEN_DIM);
-            hvx_add_bias(logits, ctx->v_b2, bs, NET_OUTPUT_DIM_PAD);
-
-            /* Count correct predictions */
-            uint32_t correct = 0;
-            for (uint32_t b_idx = 0; b_idx < bs; b_idx++) {
-                const float *row = logits + b_idx * NET_OUTPUT_DIM_PAD;
-                float max_val = row[0];
-                int max_j = 0;
-                for (int j = 1; j < NET_OUTPUT_DIM; j++) {
-                    if (row[j] > max_val) { max_val = row[j]; max_j = j; }
-                }
-                if (max_j == treq->labels[b_idx]) correct++;
-            }
-
-            /* Response */
             struct dspqueue_buffer rsp_bufs[1];
             memset(rsp_bufs, 0, sizeof(rsp_bufs));
             rsp_bufs[0].fd = bufs[0].fd;
             rsp_bufs[0].flags = DSPQUEUE_BUFFER_FLAG_DEREF;
 
             struct train_batch_rsp rsp;
-            rsp.op = 5;
+            rsp.op = OP_EVAL;
             rsp.status = 0;
             rsp.loss = 0.0f;
             rsp.correct = correct;
@@ -413,12 +441,136 @@ static void packet_callback(dspqueue_t queue, int error, void *context) {
                            sizeof(rsp), (const uint8_t *)&rsp,
                            DSPQUEUE_TIMEOUT_NONE);
 
+        } else if (op == OP_TRAIN_ALL && ctx->net_registered && ctx->vtcm_ready) {
+            /*
+             * OP_TRAIN_ALL: Run all epochs on DSP, single round-trip.
+             *
+             * Input buffers:
+             *   [0] = train_all_req struct (in rpcmem)
+             *   [1] = all training images [num_train x INPUT_DIM_PAD] f16
+             *   [2] = all training labels [num_train] uint8
+             *   [3] = all test images [num_test x INPUT_DIM_PAD] f16
+             *   [4] = all test labels [num_test] uint8
+             * Output buffer:
+             *   [5] = train_all_rsp struct (in rpcmem)
+             *
+             * No shuffling -- trains in sequential order.
+             * TODO: shuffling could be added by ARM pre-generating a shuffle
+             * index array per epoch and passing it, or DSP implementing a
+             * simple PRNG for index shuffling.
+             */
+            struct train_all_req *areq = (struct train_all_req *)bufs[0].ptr;
+            const uint16_t *all_train_images = (const uint16_t *)bufs[1].ptr;
+            const uint8_t  *all_train_labels = (const uint8_t  *)bufs[2].ptr;
+            const uint16_t *all_test_images  = (const uint16_t *)bufs[3].ptr;
+            const uint8_t  *all_test_labels  = (const uint8_t  *)bufs[4].ptr;
+            struct train_all_rsp *arsp = (struct train_all_rsp *)bufs[5].ptr;
+
+            uint32_t num_epochs  = areq->num_epochs;
+            uint32_t num_train   = areq->num_train_samples;
+            uint32_t num_test    = areq->num_test_samples;
+            uint32_t bs          = areq->batch_size;
+            float    lr          = areq->learning_rate;
+
+            if (num_epochs > MAX_EPOCHS) num_epochs = MAX_EPOCHS;
+
+            uint32_t train_batches = num_train / bs;
+            uint32_t test_batches  = num_test / bs;
+
+            /* Local label buffer for one batch (labels are uint8, small) */
+            uint8_t labels_local[MAX_BATCH];
+
+            FARF(HIGH, "OP_TRAIN_ALL: %u epochs, %u train, %u test, bs=%u, lr=%.4f",
+                 num_epochs, num_train, num_test, bs, (double)lr);
+
+            for (uint32_t epoch = 0; epoch < num_epochs; epoch++) {
+                float epoch_loss = 0.0f;
+                uint32_t epoch_correct = 0;
+
+                /* --- Training batches --- */
+                for (uint32_t batch = 0; batch < train_batches; batch++) {
+                    uint32_t offset = batch * bs;
+
+                    /* Copy this batch's f16 input from DDR to VTCM */
+                    hvx_memcpy(ctx->v_input,
+                               all_train_images + (size_t)offset * NET_INPUT_DIM_PAD,
+                               bs * NET_INPUT_DIM_PAD * sizeof(uint16_t));
+
+                    /* Copy labels to local buffer */
+                    memcpy(labels_local, all_train_labels + offset, bs);
+
+                    float batch_loss = 0.0f;
+                    uint32_t batch_correct = 0;
+                    do_train_batch(ctx, labels_local, bs, lr,
+                                   &batch_loss, &batch_correct);
+
+                    epoch_loss += batch_loss;
+                    epoch_correct += batch_correct;
+                }
+
+                arsp->epoch_losses[epoch] = epoch_loss / (float)train_batches;
+                arsp->epoch_train_acc[epoch] =
+                    (float)epoch_correct / (float)(train_batches * bs);
+
+                /* --- Evaluation batches --- */
+                uint32_t test_correct = 0;
+                for (uint32_t batch = 0; batch < test_batches; batch++) {
+                    uint32_t offset = batch * bs;
+
+                    hvx_memcpy(ctx->v_input,
+                               all_test_images + (size_t)offset * NET_INPUT_DIM_PAD,
+                               bs * NET_INPUT_DIM_PAD * sizeof(uint16_t));
+
+                    memcpy(labels_local, all_test_labels + offset, bs);
+
+                    test_correct += do_eval_batch(ctx, labels_local, bs);
+                }
+
+                arsp->epoch_test_acc[epoch] =
+                    (float)test_correct / (float)(test_batches * bs);
+
+                FARF(HIGH, "Epoch %u: loss=%.4f train_acc=%.4f test_acc=%.4f",
+                     epoch + 1,
+                     (double)arsp->epoch_losses[epoch],
+                     (double)arsp->epoch_train_acc[epoch],
+                     (double)arsp->epoch_test_acc[epoch]);
+            }
+            arsp->num_epochs_done = num_epochs;
+
+            /* Deref all 6 buffers */
+            struct dspqueue_buffer rsp_bufs[6];
+            memset(rsp_bufs, 0, sizeof(rsp_bufs));
+            for (int i = 0; i < 6; i++) {
+                rsp_bufs[i].fd = bufs[i].fd;
+                rsp_bufs[i].flags = DSPQUEUE_BUFFER_FLAG_DEREF;
+            }
+            /* Flush the response buffer so ARM can read it */
+            rsp_bufs[5].flags |= DSPQUEUE_BUFFER_FLAG_FLUSH_SENDER;
+
+            struct matmul_rsp rsp = { OP_TRAIN_ALL, 0 };
+            dspqueue_write(queue, 0, 6, rsp_bufs,
+                           sizeof(rsp), (const uint8_t *)&rsp,
+                           DSPQUEUE_TIMEOUT_NONE);
+
         } else if (op == OP_SYNC && ctx->vtcm_ready) {
-            /* Copy weights from VTCM to DDR (final export only, not used during training) */
-            hvx_copy(ctx->net_bufs[NET_BUF_W1], ctx->v_w1, W1_BYTES);
-            hvx_copy(ctx->net_bufs[NET_BUF_B1], ctx->v_b1, B1_BYTES);
-            hvx_copy(ctx->net_bufs[NET_BUF_W2], ctx->v_w2, W2_BYTES);
-            hvx_copy(ctx->net_bufs[NET_BUF_B2], ctx->v_b2, B2_BYTES);
+            /* Transpose W_T back to standard layout, then convert f16->f32 to DDR.
+             * Use g_tn_a_buf (DDR static buffer) as scratch for the transposed f16. */
+
+            /* W1_T[832,128] -> W1[128,832] in scratch, then f16->f32 to DDR */
+            blocked_transpose_f16_vtcm((_Float16 *)g_tn_a_buf, ctx->v_w1_t,
+                                       NET_INPUT_DIM_PAD, NET_HIDDEN_DIM);
+            hvx_f16_to_f32(ctx->net_bufs[NET_BUF_W1], (_Float16 *)g_tn_a_buf,
+                            NET_HIDDEN_DIM * NET_INPUT_DIM_PAD);
+
+            hvx_f16_to_f32(ctx->net_bufs[NET_BUF_B1], ctx->v_b1, NET_HIDDEN_DIM);
+
+            /* W2_T[128,64] -> W2[64,128] in scratch, then f16->f32 to DDR */
+            blocked_transpose_f16_vtcm((_Float16 *)g_tn_a_buf, ctx->v_w2_t,
+                                       NET_HIDDEN_DIM, NET_OUTPUT_DIM_PAD);
+            hvx_f16_to_f32(ctx->net_bufs[NET_BUF_W2], (_Float16 *)g_tn_a_buf,
+                            NET_OUTPUT_DIM_PAD * NET_HIDDEN_DIM);
+
+            hvx_f16_to_f32(ctx->net_bufs[NET_BUF_B2], ctx->v_b2, NET_OUTPUT_DIM_PAD);
 
             struct dspqueue_buffer rsp_bufs[4];
             memset(rsp_bufs, 0, sizeof(rsp_bufs));
@@ -452,10 +604,8 @@ AEEResult mnist_train_start(remote_handle64 handle, uint64 dsp_queue_id) {
     if (ctx->queue) return AEE_EITEMBUSY;
 
     ctx->process_time = 0;
-    ctx->time_fwd_mm = 0;
-    ctx->time_fwd_other = 0;
-    ctx->time_bwd_mm = 0;
-    ctx->time_bwd_other = 0;
+    ctx->time_fwd_mm = ctx->time_fwd_other = 0;
+    ctx->time_bwd_mm = ctx->time_bwd_other = 0;
     ctx->time_sgd = 0;
 
     int err = dspqueue_import(dsp_queue_id, packet_callback, error_callback,
@@ -464,7 +614,6 @@ AEEResult mnist_train_start(remote_handle64 handle, uint64 dsp_queue_id) {
         FARF(ERROR, "dspqueue_import failed: 0x%08x", (unsigned)err);
         return err;
     }
-
     return AEE_SUCCESS;
 }
 
@@ -477,14 +626,6 @@ AEEResult mnist_train_stop(remote_handle64 handle, uint64 *process_time) {
     ctx->queue = NULL;
     if (err) return err;
 
-    /* Release VTCM */
-    if (ctx->vtcm_res_id) {
-        HAP_compute_res_release(ctx->vtcm_res_id);
-        ctx->vtcm_res_id = 0;
-        ctx->vtcm_ready = 0;
-        FARF(HIGH, "VTCM released in stop");
-    }
-
     FARF(HIGH, "DSP timing: fwd_mm=%llu bwd_mm=%llu fwd_other=%llu bwd_other=%llu sgd=%llu total=%llu us",
          ctx->time_fwd_mm, ctx->time_bwd_mm, ctx->time_fwd_other, ctx->time_bwd_other,
          ctx->time_sgd, ctx->process_time);
@@ -493,7 +634,7 @@ AEEResult mnist_train_stop(remote_handle64 handle, uint64 *process_time) {
 }
 
 
-/* ========== Stub (not used by VTCM path) ========== */
+/* ========== Stub ========== */
 
 AEEResult mnist_train_do_matmul(remote_handle64 handle,
                                  const uint8 *a_buf, int a_buf_len,

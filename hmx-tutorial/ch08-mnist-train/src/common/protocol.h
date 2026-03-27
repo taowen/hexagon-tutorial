@@ -12,6 +12,8 @@
 #define OP_REGISTER_NET    2   /* register all network buffer pointers on DSP */
 #define OP_TRAIN_BATCH     3   /* fused forward+backward+SGD */
 #define OP_SYNC            4   /* flush DSP caches for weight buffers */
+#define OP_EVAL            5   /* forward-only evaluation on DSP */
+#define OP_TRAIN_ALL       6   /* run all epochs on DSP, single message */
 
 /* Test op codes for adjoint testing on DSP */
 #define OP_TEST_RELU_FWD   10  /* bufs: [x_inout], params: n */
@@ -38,10 +40,10 @@
 #define NET_BUF_COUNT      12
 
 /* Network dimensions (must match mnist_common.h) */
-#define NET_INPUT_DIM_PAD   800
+#define NET_INPUT_DIM_PAD   832
 #define NET_HIDDEN_DIM      128
 #define NET_OUTPUT_DIM      10
-#define NET_OUTPUT_DIM_PAD  32
+#define NET_OUTPUT_DIM_PAD  64
 
 /* Matmul request (OP_MATMUL) -- unchanged */
 struct matmul_req {
@@ -76,6 +78,35 @@ struct sync_req {
     uint32_t reserved[3];
 };
 
+/* Train-all request (OP_TRAIN_ALL)
+ * Sent with 5 buffers:
+ *   [0] = train_all_req (this struct, in rpcmem)
+ *   [1] = train_images [num_train_samples x NET_INPUT_DIM_PAD] f16
+ *   [2] = train_labels [num_train_samples] uint8
+ *   [3] = test_images  [num_test_samples x NET_INPUT_DIM_PAD] f16
+ *   [4] = test_labels  [num_test_samples] uint8
+ * Response buffer:
+ *   [0] = train_all_rsp
+ */
+#define MAX_EPOCHS 20
+
+struct train_all_req {
+    uint32_t opcode;           /* OP_TRAIN_ALL */
+    uint32_t num_epochs;
+    uint32_t num_train_samples;
+    uint32_t num_test_samples;
+    uint32_t batch_size;
+    float    learning_rate;
+    uint32_t reserved[2];
+};
+
+struct train_all_rsp {
+    float    epoch_losses[MAX_EPOCHS];      /* average loss per epoch */
+    float    epoch_train_acc[MAX_EPOCHS];   /* train accuracy per epoch */
+    float    epoch_test_acc[MAX_EPOCHS];    /* test accuracy per epoch */
+    uint32_t num_epochs_done;
+};
+
 /* Response for OP_MATMUL, OP_REGISTER_NET, OP_SYNC */
 struct matmul_rsp {
     uint32_t op;
@@ -108,6 +139,7 @@ struct test_op_rsp {
 };
 
 #define MATMUL_MAX_MESSAGE_SIZE  sizeof(struct test_op_req)
+#define MATMUL_MAX_RESPONSE_SIZE sizeof(struct train_all_rsp)
 #define MATMUL_MAX_BUFFERS       12
 
 #endif /* MNIST_TRAIN_SHARED_H */

@@ -14,8 +14,8 @@
 #define HVX_FLOATS 32  /* 1024-bit HVX vector / 32-bit float */
 
 /* Static scratch buffer for transposing B in matmul_nt.
- * Largest weight matrix in our training: W1[128x800] = 102400 floats = 400KB. */
-#define MAX_SCRATCH (128 * 800)
+ * Largest weight matrix in our training: W1[128x832] = 106496 floats = 416KB. */
+#define MAX_SCRATCH (128 * 832)
 static float g_scratch[MAX_SCRATCH] __attribute__((aligned(128)));
 
 /*

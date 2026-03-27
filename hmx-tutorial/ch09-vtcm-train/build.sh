@@ -2,10 +2,10 @@
 set -euo pipefail
 
 #
-# ch09: Build VTCM Training
+# ch09: Build VTCM Training (HVX f16)
 #
 # Produces:
-#   libmnist_train_skel.so  -- skel_vtcm.c (VTCM-resident training + OP_EVAL)
+#   libmnist_train_skel.so  -- skel_vtcm.c (VTCM-resident f16 training with HVX)
 #   train_vtcm              -- ARM driver with DSP-side evaluation
 #
 # Reuses from ch08: IDL stubs, mnist_train_skel.obj, dspqueue infrastructure
@@ -20,12 +20,13 @@ SRC="$SCRIPT_DIR/src"
 BUILD="$SCRIPT_DIR/build"
 
 SDK="$ROOT_DIR/tools/hexagon-sdk"
+HEXKL="$ROOT_DIR/tools/hexkl-addon"
 HCC="$SDK/tools/HEXAGON_Tools/19.0.04/Tools/bin/hexagon-clang"
 ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-${HOME}/android-sdk/ndk/27.2.12479018}"
 NDK_CC="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android28-clang"
 
 echo "========================================"
-echo "  ch09: Build VTCM Training (dspqueue)"
+echo "  ch09: Build VTCM Training (HVX f16)"
 echo "========================================"
 
 # ========================================
@@ -41,9 +42,9 @@ fi
 mkdir -p "$BUILD"
 
 # ========================================
-# Step 2: Compile skel_vtcm.c (DSP)
+# Step 2: Compile skel_vtcm.c (DSP, HMX f16)
 # ========================================
-echo "[2/4] Compiling skel_vtcm.c ..."
+echo "[2/4] Compiling skel_vtcm.c (HVX f16) ..."
 DSP_FLAGS=(-mv75 -O2 -fPIC -mhvx -mhvx-length=128B)
 DSP_INCS=(
     -I "$SDK/incs"
@@ -52,6 +53,7 @@ DSP_INCS=(
     -I "$CH08_SRC"
     -I "$SRC"
     -I "$CH08_BUILD"
+    -I "$HEXKL/include"
 )
 
 "$HCC" "${DSP_FLAGS[@]}" "${DSP_INCS[@]}" \
@@ -59,12 +61,13 @@ DSP_INCS=(
 echo "  -> $BUILD/skel_vtcm.obj"
 
 # ========================================
-# Step 3: Link libmnist_train_skel.so
+# Step 3: Link libmnist_train_skel.so (with hexkl_micro)
 # ========================================
 echo "[3/4] Linking libmnist_train_skel.so ..."
 "$HCC" -mv75 -shared -Wl,-Bsymbolic \
     "$BUILD/skel_vtcm.obj" \
     "$CH08_BUILD/mnist_train_skel.obj" \
+    -Wl,--start-group "$HEXKL/lib/hexagon_toolv19_v75/libhexkl_micro.a" -Wl,--end-group \
     -o "$BUILD/libmnist_train_skel.so"
 echo "  -> $BUILD/libmnist_train_skel.so"
 
@@ -101,7 +104,7 @@ echo "  Build complete!"
 echo "========================================"
 echo ""
 echo "Artifacts:"
-echo "  libmnist_train_skel.so:  $BUILD/libmnist_train_skel.so"
+echo "  libmnist_train_skel.so:  $BUILD/libmnist_train_skel.so  (HVX f16 + VTCM)"
 echo "  train_vtcm:              $BUILD/train_vtcm"
 echo ""
 echo "Next: bash run_device.sh"

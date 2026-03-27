@@ -28,9 +28,9 @@ static uint8_t *g_vtcm_base;
 static uint32_t g_vtcm_size;
 
 /* Static f16 buffers for f32->f16 conversion.
- * Largest matrix in training: batch=256, hidden=128, input=784
- *   A max: 256*800 = 204800, B max: 128*800 = 102400 */
-#define HMX_MAX_ELEMS (256 * 800)
+ * Largest matrix in training: batch=256, hidden=128, input=832
+ *   A max: 256*832 = 212992, B max: 128*832 = 106496 */
+#define HMX_MAX_ELEMS (256 * 832)
 static _Float16 g_a_f16[HMX_MAX_ELEMS] __attribute__((aligned(128)));
 static _Float16 g_b_f16[HMX_MAX_ELEMS] __attribute__((aligned(128)));
 static float    g_hmx_out[HMX_MAX_ELEMS] __attribute__((aligned(128)));  /* temp output for accumulate mode */

@@ -13,11 +13,11 @@
 #define HVX_FLOATS 32  /* 1024-bit HVX vector / 32-bit float */
 
 /* Scratch buffer for transposing matrices in matmul_nt/matmul_tn.
- * Largest: W1[128x800] = 102400 floats = 400KB.
+ * Largest: W1[128x832] = 106496 floats = 416KB.
  *
  * When USE_VTCM_SCRATCH is defined, g_scratch is a pointer set by
  * skel_vtcm.c to a VTCM address. Otherwise, static DDR array. */
-#define MAX_SCRATCH (128 * 800)
+#define MAX_SCRATCH (128 * 832)
 #ifdef USE_VTCM_SCRATCH
 static float *g_scratch = NULL;
 #else
