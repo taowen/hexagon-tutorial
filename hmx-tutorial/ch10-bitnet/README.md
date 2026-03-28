@@ -227,9 +227,9 @@ packed[i] = (w0+1) | ((w1+1)<<2) | ((w2+1)<<4) | ((w3+1)<<6)
 - `bitnet_gemv()` / `bitnet_gemv_opt()` / `bitnet_gemv_4q()` — 三个 GEMV 内核
 - `bitnet_gemv_reference()` — 标量参考实现
 
-### 实验 3：Decoder Layer 完整组件
+### 实验 3：Decoder Layer 完整组件 ✅
 
-**目标**：实现单层 decoder 需要的所有非 GEMV 算子。
+**状态**：完成。9 个 HVX f32 算子全部在真机验证通过。
 
 BitNet decoder 与标准 Llama 的区别：
 ```
@@ -240,19 +240,26 @@ RMSNorm                  RMSNorm
 MLP (SiLU gate)          MLP (ReLU² gate) + ffn_sub_norm
 ```
 
-需要实现的 HVX 算子：
+实现的 9 个 HVX 算子（全部在 `bitnet_ops.h` 中）：
 
-| 算子 | 说明 | 复杂度 |
-|------|------|--------|
-| RMSNorm | `x / sqrt(mean(x²) + eps) * weight`，出现 4 次/层 | 中（需要归约求和） |
-| RoPE | 旋转位置编码，应用于 Q 和 K | 中（sin/cos 查表 + 旋转） |
-| Attention score | `Q × K^T / sqrt(d_head)` + causal mask + softmax | 高（包含 softmax） |
-| Attention output | `softmax_scores × V` | 低（HVX matmul） |
-| KV Cache | 追加当前 token 的 K/V，decode 时逐 token 增长 | 低（memcpy） |
-| ReLU² | `relu(x)²` | 低（比较 + 乘法） |
-| Element-wise mul | gate × up | 低 |
+| 算子 | 函数 | 验证结果 |
+|------|------|----------|
+| RMSNorm | `hvx_rmsnorm_f32` | max_err=0/100000（qf32 乘 + 标量 sqrt） |
+| ReLU² | `hvx_relu2_f32` | 精确匹配（整数符号位比较 + qf32 平方） |
+| 逐元素乘法 | `hvx_mul_f32` | PASS |
+| 逐元素加法 | `hvx_add_f32` | PASS |
+| RoPE | `hvx_rope_f32` | max_err=1/100000（two-half split，cos/sin 查表） |
+| 点积 | `hvx_dot_f32` | PASS（qf32 乘加 + 标量归约） |
+| Softmax | `hvx_softmax_f32` | [0.0321, 0.0871, 0.2369, 0.6439] 全部匹配（标量 expf + HVX 归一化） |
+| 单头注意力 | `hvx_attention_decode_f32` | 4/4 输出精确匹配（dot→softmax→weighted V sum） |
+| 多头 GQA 注意力 | `hvx_mha_decode_f32` | 8/8 输出精确匹配（GQA ratio=4, head→kv_head 映射） |
 
-**验证**：每个算子单独对比 Python 输出
+**BitNet 特有算子**：
+- `attn_sub_norm`：注意力头输出拼接后、O projection 之前的 RMSNorm（复用 `hvx_rmsnorm_f32`）
+- `ffn_sub_norm`：gate×up 乘积之后、down projection 之前的 RMSNorm（复用 `hvx_rmsnorm_f32`）
+- `ReLU²`：`max(0, x)²`，替代 Llama 的 SiLU（更适合低精度训练）
+
+**产出**：`bitnet_ops.h` 包含全部 9 个函数，可直接用于组装 decoder layer。
 
 ### 实验 4：单层 Decoder 端到端
 
@@ -333,8 +340,9 @@ ch10-bitnet/
     ├── arm/
     │   └── main.c                 # ARM 驱动（dspqueue 初始化、消息发送）
     └── dsp/
-        ├── skel.c                 # DSP 端（测试调度 + 实验 1 VLUT16 测试）
-        └── bitnet_gemv.h          # 实验 2：BitNet GEMV 内核（pack + gemv + reference）
+        ├── skel.c                 # DSP 端（测试调度 + 全部实验测试）
+        ├── bitnet_gemv.h          # 实验 2：BitNet GEMV 内核（pack + gemv + reference）
+        └── bitnet_ops.h           # 实验 3：9 个 HVX f32 算子（RMSNorm/RoPE/Softmax/Attention 等）
 ```
 
 ## 8. 关键问题与风险
