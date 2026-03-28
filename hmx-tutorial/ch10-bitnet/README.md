@@ -185,24 +185,47 @@ packed[i] = (w0+1) | ((w1+1)<<2) | ((w2+1)<<4) | ((w3+1)<<6)
 
 ### 实验 2：BitNet GEMV 完整内核 ✅
 
-**状态**：完成。M=256, K=256 真机验证 0 mismatches，max relative error < 0.01%。
+**状态**：完成。M=256, K=256 真机验证三个版本全部通过（0 mismatches，max relative error < 0.01%）。
 
-实现了完整的三阶段 BitNet GEMV：
+实现了完整的三阶段 BitNet GEMV，并逐步优化：
 
 **阶段 1 — LUT 构建**：每 4 个激活分组，预计算 16 种 ±x 组合的点积，量化到 int16，vshuff 交错排列。
 
-**阶段 2 — VLUT16 查表**：packed 权重的 4-bit nibble 作为索引，VLUT16 并行查 128 个输出维度的结果。int16 结果乘以量化 scale 后累加到 float。
+**阶段 2 — VLUT16 查表**：packed 权重的 4-bit nibble 作为索引，VLUT16 并行查 128 个输出维度的结果。
 
 **阶段 3 — bit-serial 合并**：三值权重编码为 2 bit planes（enc = w + 2），各做一次查表累加，合并公式：`output = 0.5 × partial_bit0 + partial_bit1 - 0.5 × sum(x)`。
 
 **关键推导**：ternary w ∈ {-1,0,+1} 编码为 enc = w+2 ∈ {1,2,3}，拆成 bit0/bit1 后 w = bit0 + 2×bit1 - 2。VLUT16 的 LUT 计算 ±x 的所有组合，偏置项 lb = -0.5×sum(x) 补偿编码偏移。
 
-**产出**：`bitnet_gemv.h` 包含 `bitnet_pack_weights()`、`bitnet_gemv()`、`bitnet_gemv_reference()` 三个函数。
+**三个版本的性能对比**（M=256, K=256）：
 
-**性能**（当前未优化版本）：M=256, K=256 耗时 293 us。下一步需要：
-- HVX 向量化 LUT 构建和累加（当前是标量 float 循环）
-- int32 累加跨多个 Q 位置（减少 float 转换次数）
-- executorch 的 4Q 打包优化（每次处理 4 个 Q 位置）
+| 版本 | 耗时 | 加速比 | 关键优化 |
+|------|------|--------|----------|
+| `bitnet_gemv` | 293 us | 1.0x | 基线：per-Q scale + 标量 float 累加 |
+| `bitnet_gemv_opt` | 64 us | **4.6x** | 全局 scale + int32 向量累加（`vaddacc`） |
+| `bitnet_gemv_4q` | 93 us | 3.2x | 4Q 多段 VLUT16 + int32 向量累加 |
+
+**优化 1 — 全局 scale + int32 向量累加**（4.6x 加速）：
+- 用一个全局 `ls = 4×max|x| / 32767` 替代 per-Q 的 max_abs 搜索
+- 用 `Q6_Ww_vaddacc_WwVhVh` 将 VLUT16 的 int16 结果直接累加到 int32 向量，跨所有 Q 位置
+- 只在最后转一次 float，消除了 64×64 次标量 float 乘加
+
+**优化 2 — 4Q 多段 VLUT16**（概念验证）：
+- 将 4 个 Q 位置的 nibble 打包到 2 字节（每字节高低 4 bit 各一个 Q），权重体积减半
+- 用 `vlut16_build_lut_4q` 将 4 个 LUT 交错到一个向量，VLUT16 的 segment 0-3 各读一个
+- 4 次 VLUT16 + `vaddacc` 处理 4 个 Q 位置
+
+**4Q 的发现与教训**：
+- **VLUT16 segment 映射在 v75 上不对称**：seg0→pos0, seg1→pos2, seg2→pos1, seg3→pos3（seg1 和 seg2 交换了）。必须运行时验证，不能凭文档假设。
+- **int16 溢出**：不能先把 4 个 segment 的 int16 结果相加再 widen 到 int32（4×32767 > 32767），必须每对结果都用 `vaddacc` 直接 widen。
+- **字节级移位**：提取高 nibble 必须用 `Q6_Vub_vlsr_VubR(v, 4)`（字节级），不能用 `Q6_Vuh_vlsr_VuhR`（半字级），否则跨字节污染。
+- **当前 4Q 比 opt 慢**：标量 LUT 构建开销（4 个 LUT + 交错 shuffle）抵消了 VLUT16 节省。下一步需要 HVX 向量化 LUT 构建（如 executorch 的 `hvx_lut_ctor` 用 `vdeal` 转置 + qf32 并行计算）才能让 4Q 真正快于 opt。
+
+**产出**：`bitnet_gemv.h` 包含 6 个函数：
+- `vlut16_build_lut()` / `vlut16_build_lut_4q()` — 单 LUT / 4-LUT 向量构建
+- `bitnet_pack_weights()` / `bitnet_pack_weights_4q()` — 原始 / 4Q 权重打包
+- `bitnet_gemv()` / `bitnet_gemv_opt()` / `bitnet_gemv_4q()` — 三个 GEMV 内核
+- `bitnet_gemv_reference()` — 标量参考实现
 
 ### 实验 3：Decoder Layer 完整组件
 

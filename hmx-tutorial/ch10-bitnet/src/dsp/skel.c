@@ -240,6 +240,78 @@ static uint32_t run_vlut16_test3(void) {
     return pass;
 }
 
+/* ========== Segment Mapping Test ========== */
+
+/*
+ * Test 4: Verify VLUT16 segment-to-quarter mapping
+ *
+ * Builds a 4-LUT vector with known distinct values per quarter,
+ * then calls VLUT16 with segments 0-3 to see which segment reads which quarter.
+ * This is essential for getting the 4Q optimization correct.
+ */
+static uint32_t run_segment_mapping_test(void) {
+    FARF(HIGH, "=== Test 4: VLUT16 Segment Mapping ===");
+
+    /* 4 LUTs with distinct values so we can identify which segment reads which */
+    int16_t lut0[16], lut1[16], lut2[16], lut3[16];
+    for (int i = 0; i < 16; i++) {
+        lut0[i] = (int16_t)(100 + i);    /* 100-115 */
+        lut1[i] = (int16_t)(200 + i);    /* 200-215 */
+        lut2[i] = (int16_t)(300 + i);    /* 300-315 */
+        lut3[i] = (int16_t)(400 + i);    /* 400-415 */
+    }
+
+    HVX_Vector lut_vec = vlut16_build_lut_4q(lut0, lut1, lut2, lut3);
+
+    /* Index vector: all bytes = 5 (lookup entry 5 from each LUT) */
+    HVX_Vector idx_vec = Q6_Vb_vsplat_R(5);
+
+    /* Expected values for entry 5: lut0=105, lut1=205, lut2=305, lut3=405 */
+    int16_t expected[4] = { 105, 205, 305, 405 };
+
+    uint32_t pass = 1;
+    int seg_map[4] = {-1, -1, -1, -1};  /* which LUT each segment reads */
+
+    for (int seg = 0; seg < 4; seg++) {
+        HVX_VectorPair r = Q6_Wh_vlut16_VbVhR_nomatch(idx_vec, lut_vec, seg);
+        int16_t __attribute__((aligned(128))) out[64];
+        *(HVX_Vector *)out = Q6_V_lo_W(r);
+
+        int16_t got = out[0];
+        int found = -1;
+        for (int i = 0; i < 4; i++) {
+            if (got == expected[i]) { found = i; break; }
+        }
+        seg_map[seg] = found;
+
+        FARF(HIGH, "  Segment %d: got %d -> maps to lut%d (%s)",
+             seg, (int)got, found,
+             (found == seg) ? "expected" : "REMAPPED");
+    }
+
+    /* Verify all 4 LUTs are accessible (each segment maps to a unique LUT) */
+    int used[4] = {0, 0, 0, 0};
+    for (int s = 0; s < 4; s++) {
+        if (seg_map[s] >= 0 && seg_map[s] < 4) {
+            used[seg_map[s]] = 1;
+        } else {
+            FARF(HIGH, "  Segment %d: unmapped value!", s);
+            pass = 0;
+        }
+    }
+    for (int i = 0; i < 4; i++) {
+        if (!used[i]) {
+            FARF(HIGH, "  LUT %d not accessible by any segment!", i);
+            pass = 0;
+        }
+    }
+
+    FARF(HIGH, "Segment mapping: seg0->lut%d, seg1->lut%d, seg2->lut%d, seg3->lut%d",
+         seg_map[0], seg_map[1], seg_map[2], seg_map[3]);
+    FARF(HIGH, "Test 4 (Segment Mapping): %s", pass ? "PASS" : "FAIL");
+    return pass;
+}
+
 /* ========== GEMV Test ========== */
 
 /*
@@ -327,10 +399,129 @@ static uint32_t run_gemv_test(void) {
     FARF(HIGH, "Mismatches (>0.1): %d / %d", mismatches, GEMV_M);
 
     uint32_t pass = (rel_err < 0.05f) ? 1 : 0;  /* 5% relative error threshold */
-    FARF(HIGH, "GEMV Test: %s (rel_err=%.4f)", pass ? "PASS" : "FAIL", (double)rel_err);
+    FARF(HIGH, "GEMV Test (original): %s (rel_err=%.4f)", pass ? "PASS" : "FAIL", (double)rel_err);
 
+    /* ====== Optimized GEMV (global scale + int32 accum) ====== */
+    FARF(HIGH, "--- Optimized GEMV (global scale + int32 accum) ---");
+
+    float *y_opt = (float *)malloc(GEMV_M * sizeof(float));
+    if (!y_opt) {
+        FARF(ERROR, "Optimized GEMV: malloc failed");
+        free(W); free(x); free(y_ref); free(y_vlut); free(packed_w);
+        return 0;
+    }
+
+    /* Warm up */
+    bitnet_gemv_opt(x, packed_w, y_opt, GEMV_M, GEMV_K);
+
+    /* Timed run */
+    uint64_t t_opt_start = HAP_perf_get_time_us();
+    bitnet_gemv_opt(x, packed_w, y_opt, GEMV_M, GEMV_K);
+    uint64_t t_opt_end = HAP_perf_get_time_us();
+    FARF(HIGH, "GEMV opt time: %llu us (M=%d, K=%d)", t_opt_end - t_opt_start, GEMV_M, GEMV_K);
+
+    /* Compare optimized vs reference */
+    float max_err_opt = 0;
+    float max_ref_opt = 0;
+    int mismatches_opt = 0;
+    for (int m = 0; m < GEMV_M; m++) {
+        float err = y_opt[m] - y_ref[m];
+        if (err < 0) err = -err;
+        if (err > max_err_opt) max_err_opt = err;
+        float ref_abs = y_ref[m] > 0 ? y_ref[m] : -y_ref[m];
+        if (ref_abs > max_ref_opt) max_ref_opt = ref_abs;
+        if (err > 0.1f) mismatches_opt++;
+    }
+
+    float rel_err_opt = max_ref_opt > 0 ? max_err_opt / max_ref_opt : 0;
+
+    FARF(HIGH, "First 8 outputs (ref vs opt):");
+    for (int m = 0; m < 8; m++) {
+        FARF(HIGH, "  y[%d]: ref=%d/1000, opt=%d/1000, err=%d/1000",
+             m, (int)(y_ref[m] * 1000), (int)(y_opt[m] * 1000),
+             (int)((y_opt[m] - y_ref[m]) * 1000));
+    }
+    FARF(HIGH, "Opt max absolute error: %d/10000", (int)(max_err_opt * 10000));
+    FARF(HIGH, "Opt max relative error: %d/10000", (int)(rel_err_opt * 10000));
+    FARF(HIGH, "Opt mismatches (>0.1): %d / %d", mismatches_opt, GEMV_M);
+
+    uint32_t pass_opt = (rel_err_opt < 0.05f) ? 1 : 0;
+    FARF(HIGH, "GEMV Test (optimized): %s (rel_err=%.4f)", pass_opt ? "PASS" : "FAIL", (double)rel_err_opt);
+
+    FARF(HIGH, "Speedup: original=%llu us, optimized=%llu us",
+         t_end - t_start, t_opt_end - t_opt_start);
+
+    /* ====== 4Q GEMV (4 Q positions per VLUT16 cycle) ====== */
+    FARF(HIGH, "--- 4Q GEMV (4 Q positions per VLUT16 cycle) ---");
+
+    /* Run segment mapping test first */
+    uint32_t seg_pass = run_segment_mapping_test();
+
+    float *y_4q = (float *)malloc(GEMV_M * sizeof(float));
+    /* packed_4q: 2 * (Q/4) * 2 * M bytes = Q * M bytes */
+    uint8_t *packed_4q = (uint8_t *)memalign(128, GEMV_Q * GEMV_M);
+
+    if (!y_4q || !packed_4q) {
+        FARF(ERROR, "4Q GEMV: malloc failed");
+        free(y_4q); free(packed_4q);
+        free(y_opt);
+        free(W); free(x); free(y_ref); free(y_vlut); free(packed_w);
+        return 0;
+    }
+
+    /* Pack weights in 4Q format */
+    bitnet_pack_weights_4q(W, packed_4q, GEMV_M, GEMV_K);
+
+    /* Warm up */
+    bitnet_gemv_4q(x, packed_4q, y_4q, GEMV_M, GEMV_K);
+
+    /* Timed run */
+    uint64_t t_4q_start = HAP_perf_get_time_us();
+    bitnet_gemv_4q(x, packed_4q, y_4q, GEMV_M, GEMV_K);
+    uint64_t t_4q_end = HAP_perf_get_time_us();
+    FARF(HIGH, "GEMV 4Q time: %llu us (M=%d, K=%d)", t_4q_end - t_4q_start, GEMV_M, GEMV_K);
+
+    /* Compare 4Q vs reference */
+    float max_err_4q = 0;
+    float max_ref_4q = 0;
+    int mismatches_4q = 0;
+    for (int m = 0; m < GEMV_M; m++) {
+        float err = y_4q[m] - y_ref[m];
+        if (err < 0) err = -err;
+        if (err > max_err_4q) max_err_4q = err;
+        float ref_abs = y_ref[m] > 0 ? y_ref[m] : -y_ref[m];
+        if (ref_abs > max_ref_4q) max_ref_4q = ref_abs;
+        if (err > 0.1f) mismatches_4q++;
+    }
+
+    float rel_err_4q = max_ref_4q > 0 ? max_err_4q / max_ref_4q : 0;
+
+    FARF(HIGH, "First 8 outputs (ref vs 4Q):");
+    for (int m = 0; m < 8; m++) {
+        FARF(HIGH, "  y[%d]: ref=%d/1000, 4q=%d/1000, err=%d/1000",
+             m, (int)(y_ref[m] * 1000), (int)(y_4q[m] * 1000),
+             (int)((y_4q[m] - y_ref[m]) * 1000));
+    }
+    FARF(HIGH, "4Q max absolute error: %d/10000", (int)(max_err_4q * 10000));
+    FARF(HIGH, "4Q max relative error: %d/10000", (int)(rel_err_4q * 10000));
+    FARF(HIGH, "4Q mismatches (>0.1): %d / %d", mismatches_4q, GEMV_M);
+
+    uint32_t pass_4q = (rel_err_4q < 0.05f) ? 1 : 0;
+    FARF(HIGH, "GEMV Test (4Q): %s (rel_err=%.4f)", pass_4q ? "PASS" : "FAIL", (double)rel_err_4q);
+
+    FARF(HIGH, "=== Timing Summary (M=%d, K=%d) ===", GEMV_M, GEMV_K);
+    FARF(HIGH, "  Original:  %llu us", t_end - t_start);
+    FARF(HIGH, "  Optimized: %llu us", t_opt_end - t_opt_start);
+    FARF(HIGH, "  4Q:        %llu us", t_4q_end - t_4q_start);
+    FARF(HIGH, "  Speedup vs original: opt=%.1fx, 4Q=%.1fx",
+         (double)(t_end - t_start) / (double)(t_opt_end - t_opt_start),
+         (double)(t_end - t_start) / (double)(t_4q_end - t_4q_start));
+
+    free(y_4q);
+    free(packed_4q);
+    free(y_opt);
     free(W); free(x); free(y_ref); free(y_vlut); free(packed_w);
-    return pass;
+    return pass & pass_opt & pass_4q & seg_pass;
 }
 
 /* ========== Dispatch ========== */
