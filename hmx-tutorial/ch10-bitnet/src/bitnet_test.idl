@@ -1,0 +1,12 @@
+#ifndef BITNET_TEST_IDL
+#define BITNET_TEST_IDL
+
+#include "AEEStdDef.idl"
+#include "remote.idl"
+
+interface bitnet_test : remote_handle64 {
+    AEEResult start(in uint64 dsp_queue_id);
+    AEEResult stop(rout uint64 process_time);
+};
+
+#endif

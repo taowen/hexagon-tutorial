@@ -1,0 +1,331 @@
+# 第10章：BitNet — 三值权重 LLM 的 HVX VLUT16 推理
+
+## 1. 概述
+
+本章研究 BitNet（1.58-bit LLM）在 Hexagon DSP 上的高效推理。BitNet 的权重只有 {-1, 0, +1} 三个值，传统的 "反量化再乘加" 方案在 NPU 上反而比 CPU 慢 3.8 倍。T-MAN 方案（Table-lookup MAtrix multiplicatioN）的核心洞察是：**用查表替代乘法**——利用 HVX 的 VLUT16 指令，把矩阵乘法变成表查找。
+
+| 方案 | 核心操作 | 瓶颈 |
+|------|---------|------|
+| 传统反量化 | dequant → fmul → fadd | 反量化开销大，NPU 无原生 2-bit 支持 |
+| T-MAN 查表 | precompute LUT → VLUT16 gather → accumulate | 内存带宽（DMA 59 GB/s 可缓解） |
+
+**参考论文**: [T-MAN: Enabling End-to-End Low-Bit LLM Inference on NPUs via Unified Table Lookup](https://arxiv.org/abs/2511.11248)
+- 论文基于 **Snapdragon 8 Gen 3**（OnePlus 12）和 **Snapdragon 8 Elite**（OnePlus 13T）
+- Hexagon v75 架构，与我们的实验设备一致
+
+**参考实现**: `tools/executorch` (kaleid-liner/executorch fork)，核心代码：
+- HVX 内核：`backends/qualcomm/runtime/op_packages/TMANOpPackage/include/hvx_funcs.h`
+- 自定义算子：`backends/qualcomm/builders/custom_ops.py`
+- 权重打包：`backends/qualcomm/utils/utils.py` → `BitLinear`, `unpack_weights()`
+- 模型定义：`examples/qualcomm/oss_scripts/bitnet/model/static_bitnet.py`
+
+**前置章节**：
+- ch04 已覆盖 VTCM 分配、UDMA、double-buffering（本章直接复用，不重复）
+- ch05 已覆盖 HMX 矩阵乘法、权重 AH/WH 布局打包
+- ch08 已覆盖 HVX f32 GEMM 和 qf32 用法
+
+## 2. 核心原理：为什么查表能替代乘法
+
+### 2.1 三值权重的数学性质
+
+对于一组 g=4 个连续的激活值 (x₀, x₁, x₂, x₃) 和对应的三值权重 (w₀, w₁, w₂, w₃)，点积为：
+
+```
+dot = w₀·x₀ + w₁·x₁ + w₂·x₂ + w₃·x₃
+```
+
+因为每个 wᵢ ∈ {-1, +1}（忽略 0 的情况，后面处理），4 个权重共有 2⁴ = 16 种组合。这 16 个可能的点积结果可以**预计算**成一张查找表（LUT），然后用权重的 bit pattern 作为索引直接查出结果。
+
+### 2.2 镜像优化
+
+LUT 有对称性：`LUT[i] = -LUT[15 - i]`。因此只需计算 8 个奇数索引，偶数索引通过取反得到，计算量减半。
+
+### 2.3 三值编码处理 {0} 的情况
+
+实际三值权重包含 0。编码方式：将 {-1, 0, +1} 映射为 2-bit 值 {0, 1, 2}（加 1 偏移）。用 bit-serial 分解：
+- bit 0：决定是否包含该激活（类似 mask）
+- bit 1：决定符号方向
+
+最终结果通过 `hvx_bit_serial` 合并：`output = 0.5 × partial_bit0 + partial_bit1`，并加上偏置校正 `lb`（补偿编码偏移）。
+
+## 3. HVX VLUT16 指令详解
+
+```
+Q6_Wh_vlut16_VbVhR_nomatch(indices, lut, segment)
+```
+
+| 参数 | 含义 |
+|------|------|
+| `indices` | 128 字节，每字节低 4 bit 是 LUT 索引（0-15） |
+| `lut` | 16 条目 × int16 的查找表（需要特殊交错布局） |
+| `segment` | 0-3，选择 128B 向量中 4 组 16 条目 LUT 中的一组 |
+| 返回值 | HVX_VectorPair：lo = 偶数字节的查表结果，hi = 奇数字节的查表结果 |
+
+**关键特性**：
+- 一条指令处理 128 个索引的并行查表
+- 每次查表等效于 128 次乘加操作
+- 对于 int16 激活 + 16 条目 LUT = 1024 等效 MADDs
+
+### 3.1 实验 1 验证结果
+
+在 8 Gen 3 真机上验证了 VLUT16 的三个核心行为：
+
+**LUT 必须经过 vshuff 交错排列**：直接把 16 个 int16 线性放进向量是不行的。需要经过 4 级 `Q6_W_vshuff_VVR`（步长 -4, -8, -16, -32）将条目交错排列到硬件期望的位置。128B 向量容纳 64 个 int16 = 4 组 × 16 条目，segment 参数选择用哪一组。
+
+```c
+// 构建 VLUT16 LUT 的正确方式：
+// 1. 每个 LUT 条目 splat 成一个完整向量
+HVX_Vector l_tmp[16];
+for (int i = 0; i < 16; i++) {
+    l_tmp[i] = Q6_Vh_vsplat_R(values[i]);
+}
+
+// 2. 四级 vshuff 蝶形交错（参考 executorch hvx_lut_ctor）
+//    步骤 1: vshuff(l[i+1], l[i], -4)   // 32-bit 交错
+//    步骤 2: vshuff 结果, -8             // 64-bit 交错
+//    步骤 3: vshuff 结果, -16            // 128-bit 交错
+//    步骤 4: vshuff 结果, -32            // 256-bit 交错
+
+// 3. 取第一个输出向量作为 VLUT16 的 lut 参数
+```
+
+**结果分 even/odd 字节**：VLUT16 返回 VectorPair，lo 向量包含偶数字节位置（0, 2, 4, ...）的查表结果，hi 向量包含奇数字节位置（1, 3, 5, ...）的查表结果。验证方法：偶数字节放索引 5（期望 500），奇数字节放索引 10（期望 1000），lo 全是 500，hi 全是 1000。64/64 正确。
+
+**查表即乘法**：给定 4 个激活值 (1, 2, 3, 4)，预计算 16 个二值权重组合的点积作为 LUT，用 VLUT16 查出结果——与直接计算完全一致。例如 index=0x0F（所有权重 +1），VLUT16 返回 2560（= 10.0 × 256 scale），即 1+2+3+4=10。
+
+## 4. 完整数据流
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Activation x (fp16, shape: [1, K])                         │
+└──────────────────────┬──────────────────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────────────────┐
+│  TMANPrecompute (hvx_lut_ctor)                              │
+│                                                             │
+│  1. 每 4 个激活分一组: (x₀, x₁, x₂, x₃)                    │
+│  2. 计算 16 个可能的点积 → LUT[0..15] (int16)               │
+│  3. 计算激活量化 scale (ls = absmax / 32767)                 │
+│  4. 计算偏置校正 lb = -0.5 × Σ(所有激活)                    │
+│  5. shuffle LUT 到 VLUT16 所需的交错布局                     │
+│                                                             │
+│  输出: lvec[] (LUT向量), ls (scale), lb (bias)               │
+└──────────────────────┬──────────────────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────────────────┐
+│  TMANLinear (hvx_tbl, GroupSize==0 特化)                     │
+│                                                             │
+│  对每个权重字节:                                              │
+│    w_lo = w & 0x0F          // 低 4 bit 索引                 │
+│    w_hi = w >> 4            // 高 4 bit 索引                 │
+│    result = VLUT16(w_lo, LUT, seg)  // 128 路并行查表        │
+│                                                             │
+│  累加: int16 → widen 到 int32                                │
+│                                                             │
+│  块边界处:                                                    │
+│    int32 → float → ×ls → +lb → ×weight_scale → qf32 累加    │
+└──────────────────────┬──────────────────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────────────────┐
+│  TMANFinalize (hvx_bit_serial)                              │
+│                                                             │
+│  合并 bit planes: 0.5 × partial_bit0 + partial_bit1         │
+│  qf32 → fp16 输出                                           │
+└──────────────────────┬──────────────────────────────────────┘
+                       │
+                       ▼
+              Output y (fp16, shape: [1, M])
+```
+
+## 5. 权重预处理与内存布局
+
+### 5.1 权重打包（ARM 侧，离线完成）
+
+```python
+# 三值 {-1, 0, +1} → 2-bit {0, 1, 2}（加1偏移）
+# 4 个值打包到 1 个 uint8
+packed[i] = (w0+1) | ((w1+1)<<2) | ((w2+1)<<4) | ((w3+1)<<6)
+```
+
+### 5.2 Bit 分解与分组
+
+```python
+# 每个 uint8 → 2 bit planes
+# 每 bit plane 中，每 4 个连续 K 维度的 bit 打包成 4-bit 索引
+# 这个 4-bit 索引直接用于 VLUT16 查表
+```
+
+### 5.3 Tile 布局
+
+权重被重排为 `(P_tiles, Q_tiles, tile_p//vec_p, tile_q//vec_q, vec_q, vec_p)` 的分块格式：
+- **P 维度**（输出维度）：对应 VLUT16 的 128 路并行
+- **Q 维度**（输入维度 / g）：对应 LUT 分组
+- Even/odd 交错以匹配 VLUT16 的 even/odd byte 输出模式
+- 两个相邻 Q 索引打包到一个字节的高低 4 bit
+
+## 6. 实验计划
+
+**目标模型**：`microsoft/bitnet-b1.58-2B-4T`
+- hidden=2560, heads=20, kv_heads=5, intermediate=6912, layers=30
+- 词表 128256（Llama-3 tokenizer）
+- 权重 ~600MB（1.58-bit packed）
+
+### 实验 1：VLUT16 指令探索 ✅
+
+真机验证 3/3 测试全部通过。
+
+- LUT 必须经过 4 级 vshuff 交错排列（直接线性放入会得到错误结果）
+- 结果 VectorPair 的 lo/hi 分别对应偶数/奇数字节位置的查表结果
+- VLUT16 可以正确实现 "查表即乘法"：预计算 16 种二值权重组合的点积，用权重 bit pattern 做索引
+
+**产出**：`vlut16_shuffle()` 和 `vlut16_build_lut()` 两个可复用 helper 函数。
+
+### 实验 2：BitNet GEMV 完整内核
+
+**目标**：从 fp16 激活 + packed 三值权重，到 fp16 输出，一个完整的 BitNet 线性层。
+
+这是本章的核心内核，包含三个阶段：
+
+**阶段 1 — LUT 构建**（`hvx_lut_ctor`）：
+- 每 4 个激活分组，预计算 16 种二值组合的点积
+- 镜像优化：只算 8 个奇数项，偶数项取反
+- 量化到 int16 + vshuff 交错排列
+
+**阶段 2 — VLUT16 查表累加**（`hvx_tbl`）：
+- 权重字节拆成高低 4-bit 索引 → VLUT16 并行查表
+- int16 结果 widen 到 int32 累加
+- 块边界处 flush：int32 → float → ×scale → +bias → qf32 累加
+
+**阶段 3 — bit-serial 合并**（`hvx_bit_serial`）：
+- 三值权重分为 2 个 bit plane，各做一次查表累加
+- 合并：`output = 0.5 × partial_bit0 + partial_bit1 + lb`
+
+**验证**：用 Python 参考实现逐元素对比，误差 < 1%
+**性能**：测量 M=6912, K=2560 的 GEMV 延迟，对比反量化乘加方案
+
+### 实验 3：Decoder Layer 完整组件
+
+**目标**：实现单层 decoder 需要的所有非 GEMV 算子。
+
+BitNet decoder 与标准 Llama 的区别：
+```
+标准 Llama:              BitNet b1.58:
+RMSNorm                  RMSNorm
+Attention                Attention + attn_sub_norm（注意力输出额外归一化）
+RMSNorm                  RMSNorm
+MLP (SiLU gate)          MLP (ReLU² gate) + ffn_sub_norm
+```
+
+需要实现的 HVX 算子：
+
+| 算子 | 说明 | 复杂度 |
+|------|------|--------|
+| RMSNorm | `x / sqrt(mean(x²) + eps) * weight`，出现 4 次/层 | 中（需要归约求和） |
+| RoPE | 旋转位置编码，应用于 Q 和 K | 中（sin/cos 查表 + 旋转） |
+| Attention score | `Q × K^T / sqrt(d_head)` + causal mask + softmax | 高（包含 softmax） |
+| Attention output | `softmax_scores × V` | 低（HVX matmul） |
+| KV Cache | 追加当前 token 的 K/V，decode 时逐 token 增长 | 低（memcpy） |
+| ReLU² | `relu(x)²` | 低（比较 + 乘法） |
+| Element-wise mul | gate × up | 低 |
+
+**验证**：每个算子单独对比 Python 输出
+
+### 实验 4：单层 Decoder 端到端
+
+**目标**：组装一个完整的 decoder layer，加载真实权重，验证正确性。
+
+完整数据流（decode 一个 token）：
+```
+input [1, 2560]
+  → RMSNorm
+  → Q/K/V projection (3 个 BitNet GEMV)
+  → RoPE(Q), RoPE(K)
+  → KV Cache append
+  → Attention: Q×K^T → softmax → ×V
+  → attn_sub_norm → O projection (BitNet GEMV)
+  → residual add
+  → RMSNorm
+  → gate/up projection (2 个 BitNet GEMV)
+  → ReLU² + element-wise mul
+  → ffn_sub_norm → down projection (BitNet GEMV)
+  → residual add
+output [1, 2560]
+```
+
+一层包含 **7 个 BitNet GEMV** + 若干 HVX 向量算子。
+
+**权重加载**：Python 脚本从 HuggingFace 下载模型，转换为 packed 二进制格式，adb push 到设备。
+**验证**：对比 PyTorch `model.layers[0](x)` 的输出，误差 < 0.1%。
+
+### 实验 5：完整推理 — 文本输入到文本输出
+
+**目标**：输入一句话，BitNet-2B 在 DSP 上自回归生成文本。
+
+```
+$ echo "The future of AI is" | ./bitnet_infer --model bitnet-2b-4t.bin
+The future of AI is ...
+```
+
+需要补全的模块：
+
+| 模块 | 位置 | 说明 |
+|------|------|------|
+| Tokenizer | ARM | Llama-3 tokenizer（sentencepiece 或 tiktoken），文本 → token IDs |
+| Embedding | ARM/DSP | token ID → fp16 向量 [2560]，查表（128256 × 2560 × 2B ≈ 625MB） |
+| 30 层 Decoder | DSP | 实验 4 的 layer × 30，逐层串行 |
+| LM Head | DSP | hidden [2560] → logits [128256]，全精度线性层（非 BitNet） |
+| Sampling | ARM | greedy argmax 或 top-k/top-p |
+| Detokenizer | ARM | token ID → 文本 |
+
+**内存规划**：
+- 权重（1.58-bit packed）：~600MB DDR
+- Embedding + LM Head（fp16）：~1.2GB DDR
+- KV Cache（fp16，per layer）：30 × 2 × ctx_len × 5 × 128 × 2B
+- VTCM（8MB）：当前层的 LUT + 权重 tile + 中间激活
+
+**生成循环**：
+```
+tokens = tokenize(prompt)
+for each token in prefill:
+    run_all_layers(token)  // 填充 KV cache
+for i in range(max_new_tokens):
+    logits = run_all_layers(last_token)
+    next_token = sample(logits)
+    print(detokenize(next_token))
+    if next_token == eos: break
+```
+
+## 7. 当前目录结构
+
+```
+ch10-bitnet/
+├── README.md
+├── build.sh
+├── run_device.sh
+└── src/
+    ├── bitnet_test.idl            # FastRPC 接口（dspqueue bootstrap）
+    ├── common/
+    │   └── protocol.h             # 消息协议（操作码、请求/响应结构）
+    ├── arm/
+    │   └── main.c                 # ARM 驱动（dspqueue 初始化、消息发送）
+    └── dsp/
+        └── skel.c                 # DSP 端（VLUT16 测试 + vlut16_shuffle helper）
+```
+
+## 8. 关键问题与风险
+
+**已验证**：
+- ✅ `Q6_Wh_vlut16_VbVhR_nomatch` 在 v75 / 8 Gen 3 上可用
+- ✅ LUT 交错布局：4 级 vshuff（-4, -8, -16, -32）
+- ✅ 所有 4 个 segment（0-3）行为一致（对 splatted LUT 而言）
+- ✅ even/odd byte 分流：lo = 偶数字节结果, hi = 奇数字节结果
+
+**待验证**：
+- Embedding + LM Head 的内存（~1.8GB）是否放得下——可能需要 mmap 或分块加载
+- int16 LUT 累加到 int32 的溢出边界（K=2560 时累加 640 组）
+- LM Head 是全精度线性层还是也做了量化——决定用 HVX qf16 matmul 还是 VLUT16
+- 30 层 × 7 GEMV 的总延迟能否做到可用的 token/s（目标 >5 tok/s）
+- KV Cache 管理：prefill 批量写入 vs decode 逐 token 追加
