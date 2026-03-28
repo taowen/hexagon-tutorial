@@ -138,6 +138,44 @@ int main(int argc, char **argv) {
            g_rsp.op, g_rsp.status, g_rsp.pass);
     all_pass &= g_rsp.pass;
 
+    /* Send Attention test request */
+    printf("[ARM] Sending Attention test request...\n");
+    memset(&req, 0, sizeof(req));
+    req.op = OP_ATTN_TEST;
+    req.test_id = 0;
+
+    ret = dspqueue_write(queue, 0, 0, NULL,
+                          sizeof(req), (const uint8_t *)&req, 1000000);
+    if (ret != 0) {
+        fprintf(stderr, "dspqueue_write (ATTN) failed: 0x%08x\n", (unsigned)ret);
+        goto cleanup;
+    }
+
+    sem_wait(&g_done);
+
+    printf("\n[ARM] Attention Response: op=%u status=%u pass=%u\n",
+           g_rsp.op, g_rsp.status, g_rsp.pass);
+    all_pass &= g_rsp.pass;
+
+    /* Send Ops test request (rmsnorm, relu2, mul, add, rope) */
+    printf("[ARM] Sending Ops test request...\n");
+    memset(&req, 0, sizeof(req));
+    req.op = OP_OPS_TEST;
+    req.test_id = 0;
+
+    ret = dspqueue_write(queue, 0, 0, NULL,
+                          sizeof(req), (const uint8_t *)&req, 1000000);
+    if (ret != 0) {
+        fprintf(stderr, "dspqueue_write (OPS) failed: 0x%08x\n", (unsigned)ret);
+        goto cleanup;
+    }
+
+    sem_wait(&g_done);
+
+    printf("\n[ARM] Ops Response: op=%u status=%u pass=%u\n",
+           g_rsp.op, g_rsp.status, g_rsp.pass);
+    all_pass &= g_rsp.pass;
+
     if (all_pass) {
         printf("[ARM] *** ALL TESTS PASSED ***\n");
     } else {

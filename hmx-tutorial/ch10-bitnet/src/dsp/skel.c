@@ -20,6 +20,7 @@
 #include "dspqueue.h"
 #include "common/protocol.h"
 #include "dsp/bitnet_gemv.h"
+#include "dsp/bitnet_ops.h"
 
 /* ========== DSP context ========== */
 
@@ -524,6 +525,488 @@ static uint32_t run_gemv_test(void) {
     return pass & pass_opt & pass_4q & seg_pass;
 }
 
+/* ========== Softmax + Attention Tests ========== */
+
+static uint32_t run_softmax_test(void) {
+    FARF(HIGH, "=== Softmax Test ===");
+
+    /* Input: [1.0, 2.0, 3.0, 4.0] padded to 32 for HVX alignment */
+    float __attribute__((aligned(128))) input[32];
+    float __attribute__((aligned(128))) output[32];
+    memset(input, 0, sizeof(input));
+    memset(output, 0, sizeof(output));
+    input[0] = 1.0f;
+    input[1] = 2.0f;
+    input[2] = 3.0f;
+    input[3] = 4.0f;
+
+    hvx_softmax_f32(input, output, 4);
+
+    /* Expected: [0.0321, 0.0871, 0.2369, 0.6439] */
+    float expected[4] = { 0.0321f, 0.0871f, 0.2369f, 0.6439f };
+    float tolerance = 0.002f;
+
+    uint32_t pass = 1;
+    for (int i = 0; i < 4; i++) {
+        float err = output[i] - expected[i];
+        if (err < 0) err = -err;
+        int ok = (err < tolerance);
+        FARF(HIGH, "  softmax[%d]: got=%d/10000, expected=%d/10000 %s",
+             i, (int)(output[i] * 10000), (int)(expected[i] * 10000),
+             ok ? "PASS" : "FAIL");
+        if (!ok) pass = 0;
+    }
+
+    /* Verify sum ~= 1.0 */
+    float sum = 0;
+    for (int i = 0; i < 4; i++) sum += output[i];
+    FARF(HIGH, "  softmax sum=%d/10000 (expect 10000)", (int)(sum * 10000));
+    if (sum < 0.999f || sum > 1.001f) pass = 0;
+
+    FARF(HIGH, "Softmax Test: %s", pass ? "PASS" : "FAIL");
+    return pass;
+}
+
+static uint32_t run_attention_test(void) {
+    FARF(HIGH, "=== Attention Test (minimal) ===");
+
+    /* seq_len=2, head_dim=128 (padded from logical 4 to meet HVX requirements).
+     * We put meaningful data in first 4 dims, rest zero. */
+    #define ATTN_TEST_DIM 128
+    #define ATTN_TEST_SEQ 2
+
+    float *q = (float *)memalign(128, ATTN_TEST_DIM * sizeof(float));
+    float *k_cache = (float *)memalign(128, ATTN_TEST_SEQ * ATTN_TEST_DIM * sizeof(float));
+    float *v_cache = (float *)memalign(128, ATTN_TEST_SEQ * ATTN_TEST_DIM * sizeof(float));
+    float *out = (float *)memalign(128, ATTN_TEST_DIM * sizeof(float));
+
+    if (!q || !k_cache || !v_cache || !out) {
+        FARF(ERROR, "Attention test: malloc failed");
+        free(q); free(k_cache); free(v_cache); free(out);
+        return 0;
+    }
+
+    memset(q, 0, ATTN_TEST_DIM * sizeof(float));
+    memset(k_cache, 0, ATTN_TEST_SEQ * ATTN_TEST_DIM * sizeof(float));
+    memset(v_cache, 0, ATTN_TEST_SEQ * ATTN_TEST_DIM * sizeof(float));
+    memset(out, 0, ATTN_TEST_DIM * sizeof(float));
+
+    /* q = [1,0,0,0, 0,...,0] */
+    q[0] = 1.0f;
+
+    /* k_cache[0] = [1,0,0,0, 0,...,0] */
+    k_cache[0] = 1.0f;
+    /* k_cache[1] = [0,1,0,0, 0,...,0] */
+    k_cache[ATTN_TEST_DIM + 1] = 1.0f;
+
+    /* v_cache[0] = [10,20,30,40, 0,...,0] */
+    v_cache[0] = 10.0f; v_cache[1] = 20.0f;
+    v_cache[2] = 30.0f; v_cache[3] = 40.0f;
+    /* v_cache[1] = [50,60,70,80, 0,...,0] */
+    v_cache[ATTN_TEST_DIM + 0] = 50.0f; v_cache[ATTN_TEST_DIM + 1] = 60.0f;
+    v_cache[ATTN_TEST_DIM + 2] = 70.0f; v_cache[ATTN_TEST_DIM + 3] = 80.0f;
+
+    /* scale = 1.0 (not 1/sqrt(128) -- keep simple for verification) */
+    float scale = 1.0f;
+
+    hvx_attention_decode_f32(q, k_cache, v_cache, out,
+                             ATTN_TEST_DIM, ATTN_TEST_SEQ, scale);
+
+    /* Expected:
+     * score[0] = dot(q, k0) * 1.0 = 1.0
+     * score[1] = dot(q, k1) * 1.0 = 0.0
+     * attn = softmax([1.0, 0.0]) = [0.7311, 0.2689]
+     * out = 0.7311*[10,20,30,40] + 0.2689*[50,60,70,80]
+     *     = [20.76, 30.76, 40.76, 50.76] */
+    float attn0 = expf(1.0f) / (expf(1.0f) + expf(0.0f));
+    float attn1 = expf(0.0f) / (expf(1.0f) + expf(0.0f));
+    float expected[4];
+    expected[0] = attn0 * 10.0f + attn1 * 50.0f;
+    expected[1] = attn0 * 20.0f + attn1 * 60.0f;
+    expected[2] = attn0 * 30.0f + attn1 * 70.0f;
+    expected[3] = attn0 * 40.0f + attn1 * 80.0f;
+
+    uint32_t pass = 1;
+    float tolerance = 0.1f;
+    for (int i = 0; i < 4; i++) {
+        float err = out[i] - expected[i];
+        if (err < 0) err = -err;
+        int ok = (err < tolerance);
+        FARF(HIGH, "  attn_out[%d]: got=%d/100, expected=%d/100 %s",
+             i, (int)(out[i] * 100), (int)(expected[i] * 100),
+             ok ? "PASS" : "FAIL");
+        if (!ok) pass = 0;
+    }
+
+    /* Rest of output should be ~0 */
+    float rest_max = 0;
+    for (int i = 4; i < ATTN_TEST_DIM; i++) {
+        float a = out[i] > 0 ? out[i] : -out[i];
+        if (a > rest_max) rest_max = a;
+    }
+    FARF(HIGH, "  rest max abs=%d/10000 (expect ~0)", (int)(rest_max * 10000));
+    if (rest_max > 0.01f) {
+        FARF(HIGH, "  WARNING: non-zero values in unused dimensions");
+        pass = 0;
+    }
+
+    FARF(HIGH, "Attention Test: %s", pass ? "PASS" : "FAIL");
+
+    free(q); free(k_cache); free(v_cache); free(out);
+    return pass;
+}
+
+static uint32_t run_mha_gqa_test(void) {
+    FARF(HIGH, "=== MHA GQA Test (2 heads, 1 kv head) ===");
+
+    /* Minimal GQA test: num_heads=2, num_kv_heads=1, head_dim=128, seq_len=1 */
+    #define MHA_HEADS     2
+    #define MHA_KV_HEADS  1
+    #define MHA_DIM       128
+    #define MHA_SEQ       1
+
+    float *q_all  = (float *)memalign(128, MHA_HEADS * MHA_DIM * sizeof(float));
+    float *k_cache = (float *)memalign(128, MHA_KV_HEADS * MHA_SEQ * MHA_DIM * sizeof(float));
+    float *v_cache = (float *)memalign(128, MHA_KV_HEADS * MHA_SEQ * MHA_DIM * sizeof(float));
+    float *out     = (float *)memalign(128, MHA_HEADS * MHA_DIM * sizeof(float));
+
+    if (!q_all || !k_cache || !v_cache || !out) {
+        FARF(ERROR, "MHA GQA test: malloc failed");
+        free(q_all); free(k_cache); free(v_cache); free(out);
+        return 0;
+    }
+
+    memset(q_all, 0, MHA_HEADS * MHA_DIM * sizeof(float));
+    memset(k_cache, 0, MHA_KV_HEADS * MHA_SEQ * MHA_DIM * sizeof(float));
+    memset(v_cache, 0, MHA_KV_HEADS * MHA_SEQ * MHA_DIM * sizeof(float));
+    memset(out, 0, MHA_HEADS * MHA_DIM * sizeof(float));
+
+    /* q head 0 = [1,0,...], q head 1 = [0,1,0,...] */
+    q_all[0] = 1.0f;
+    q_all[MHA_DIM + 1] = 1.0f;
+
+    /* single kv: k = [1,1,0,...], v = [5,10,15,20, 0,...] */
+    k_cache[0] = 1.0f; k_cache[1] = 1.0f;
+    v_cache[0] = 5.0f; v_cache[1] = 10.0f;
+    v_cache[2] = 15.0f; v_cache[3] = 20.0f;
+
+    float scale = 1.0f;
+    hvx_mha_decode_f32(q_all, k_cache, v_cache, out,
+                       MHA_HEADS, MHA_KV_HEADS, MHA_DIM, MHA_SEQ, scale);
+
+    /* With seq_len=1, softmax([score]) = [1.0], so out = v_cache.
+     * Both heads should output the same v_cache values. */
+    uint32_t pass = 1;
+    float tolerance = 0.1f;
+    for (int h = 0; h < MHA_HEADS; h++) {
+        for (int d = 0; d < 4; d++) {
+            float got = out[h * MHA_DIM + d];
+            float exp_val = v_cache[d];
+            float err = got - exp_val;
+            if (err < 0) err = -err;
+            int ok = (err < tolerance);
+            FARF(HIGH, "  head%d out[%d]: got=%d/100, expected=%d/100 %s",
+                 h, d, (int)(got * 100), (int)(exp_val * 100),
+                 ok ? "PASS" : "FAIL");
+            if (!ok) pass = 0;
+        }
+    }
+
+    FARF(HIGH, "MHA GQA Test: %s", pass ? "PASS" : "FAIL");
+
+    free(q_all); free(k_cache); free(v_cache); free(out);
+    return pass;
+}
+
+static void run_attn_test_dispatch(dspqueue_t queue) {
+    uint32_t p1 = run_softmax_test();
+    uint32_t p2 = run_attention_test();
+    uint32_t p3 = run_mha_gqa_test();
+
+    uint32_t pass = p1 & p2 & p3;
+    FARF(HIGH, "Attn tests overall: softmax=%u attn=%u mha=%u => %s",
+         p1, p2, p3, pass ? "ALL PASS" : "SOME FAILED");
+
+    struct vlut16_test_rsp rsp;
+    rsp.op = OP_ATTN_TEST;
+    rsp.status = 0;
+    rsp.pass = pass;
+
+    dspqueue_write(queue, 0, 0, NULL,
+                   sizeof(rsp), (const uint8_t *)&rsp,
+                   DSPQUEUE_TIMEOUT_NONE);
+}
+
+/* ========== F32 Operator Tests ========== */
+
+static uint32_t run_rmsnorm_test(void) {
+    FARF(HIGH, "=== RMSNorm Test ===");
+    #define NORM_N 64  /* 2 HVX vectors */
+    float __attribute__((aligned(128))) x[NORM_N];
+    float __attribute__((aligned(128))) w[NORM_N];
+    float __attribute__((aligned(128))) out[NORM_N];
+    float __attribute__((aligned(128))) ref[NORM_N];
+
+    /* x = [1, 2, 3, ..., 64], weight = all 1.0 */
+    for (int i = 0; i < NORM_N; i++) {
+        x[i] = (float)(i + 1);
+        w[i] = 1.0f;
+    }
+
+    /* Scalar reference: rms = sqrt(mean(x^2) + eps) */
+    float sum_sq = 0.0f;
+    for (int i = 0; i < NORM_N; i++) sum_sq += x[i] * x[i];
+    float rms = sqrtf(sum_sq / (float)NORM_N + 1e-5f);
+    for (int i = 0; i < NORM_N; i++) ref[i] = x[i] / rms;
+
+    hvx_rmsnorm_f32(x, w, out, NORM_N, 1e-5f);
+
+    uint32_t pass = 1;
+    float max_err = 0;
+    for (int i = 0; i < NORM_N; i++) {
+        float err = out[i] - ref[i];
+        if (err < 0) err = -err;
+        if (err > max_err) max_err = err;
+    }
+    FARF(HIGH, "  RMSNorm max_err=%d/100000 (64 elements, w=1)", (int)(max_err * 100000));
+    /* qf32 has ~1e-3 relative error, so allow 0.01 absolute for values up to ~2.5 */
+    if (max_err > 0.02f) {
+        FARF(HIGH, "  RMSNorm FAIL: error too large");
+        pass = 0;
+    }
+
+    /* Also test with non-trivial weights */
+    for (int i = 0; i < NORM_N; i++) w[i] = 2.0f;
+    for (int i = 0; i < NORM_N; i++) ref[i] = x[i] / rms * 2.0f;
+    hvx_rmsnorm_f32(x, w, out, NORM_N, 1e-5f);
+    float max_err2 = 0;
+    for (int i = 0; i < NORM_N; i++) {
+        float err = out[i] - ref[i];
+        if (err < 0) err = -err;
+        if (err > max_err2) max_err2 = err;
+    }
+    FARF(HIGH, "  RMSNorm(w=2) max_err=%d/100000", (int)(max_err2 * 100000));
+    if (max_err2 > 0.05f) {
+        FARF(HIGH, "  RMSNorm(w=2) FAIL");
+        pass = 0;
+    }
+
+    FARF(HIGH, "RMSNorm Test: %s", pass ? "PASS" : "FAIL");
+    return pass;
+}
+
+static uint32_t run_relu2_test(void) {
+    FARF(HIGH, "=== ReLU2 Test ===");
+    #define RELU_N 32
+    float __attribute__((aligned(128))) x[RELU_N];
+    float __attribute__((aligned(128))) out[RELU_N];
+
+    /* Mix of positive, negative, and zero */
+    for (int i = 0; i < RELU_N; i++) {
+        x[i] = (float)(i - 16);  /* -16, -15, ..., -1, 0, 1, ..., 15 */
+    }
+
+    hvx_relu2_f32(x, out, RELU_N);
+
+    uint32_t pass = 1;
+    for (int i = 0; i < RELU_N; i++) {
+        float v = x[i] > 0.0f ? x[i] : 0.0f;
+        float expected = v * v;
+        float err = out[i] - expected;
+        if (err < 0) err = -err;
+        if (err > 0.01f) {
+            FARF(HIGH, "  relu2[%d]: x=%d, got=%d/100, expected=%d/100 FAIL",
+                 i, (int)x[i], (int)(out[i] * 100), (int)(expected * 100));
+            pass = 0;
+        }
+    }
+
+    /* Check: negatives should be exactly 0 */
+    for (int i = 0; i < 16; i++) {
+        if (out[i] != 0.0f) {
+            FARF(HIGH, "  relu2[%d]: negative input but out=%d/10000 (not 0!)",
+                 i, (int)(out[i] * 10000));
+            pass = 0;
+        }
+    }
+    /* Check: zero should be 0 */
+    if (out[16] != 0.0f) {
+        FARF(HIGH, "  relu2[16]: zero input but out=%d/10000", (int)(out[16] * 10000));
+        pass = 0;
+    }
+
+    FARF(HIGH, "  relu2 samples: out[0]=%d(exp 0), out[17]=%d(exp 100), out[31]=%d(exp 22500)",
+         (int)(out[0] * 100), (int)(out[17] * 100), (int)(out[31] * 100));
+    FARF(HIGH, "ReLU2 Test: %s", pass ? "PASS" : "FAIL");
+    return pass;
+}
+
+static uint32_t run_mul_test(void) {
+    FARF(HIGH, "=== Mul Test ===");
+    #define MUL_N 32
+    float __attribute__((aligned(128))) a[MUL_N];
+    float __attribute__((aligned(128))) b[MUL_N];
+    float __attribute__((aligned(128))) out[MUL_N];
+
+    for (int i = 0; i < MUL_N; i++) {
+        a[i] = (float)(i + 1);       /* 1, 2, ..., 32 */
+        b[i] = (float)(i + 1) * 0.1f; /* 0.1, 0.2, ..., 3.2 */
+    }
+
+    hvx_mul_f32(a, b, out, MUL_N);
+
+    uint32_t pass = 1;
+    float max_err = 0;
+    for (int i = 0; i < MUL_N; i++) {
+        float expected = a[i] * b[i];
+        float err = out[i] - expected;
+        if (err < 0) err = -err;
+        if (err > max_err) max_err = err;
+    }
+    FARF(HIGH, "  Mul max_err=%d/100000", (int)(max_err * 100000));
+    FARF(HIGH, "  Mul samples: out[0]=%d/1000(exp 100), out[31]=%d/1000(exp 102400)",
+         (int)(out[0] * 1000), (int)(out[31] * 1000));
+    if (max_err > 0.1f) {
+        FARF(HIGH, "  Mul FAIL: error too large");
+        pass = 0;
+    }
+    FARF(HIGH, "Mul Test: %s", pass ? "PASS" : "FAIL");
+    return pass;
+}
+
+static uint32_t run_add_test(void) {
+    FARF(HIGH, "=== Add Test ===");
+    #define ADD_N 32
+    float __attribute__((aligned(128))) a[ADD_N];
+    float __attribute__((aligned(128))) b[ADD_N];
+    float __attribute__((aligned(128))) out[ADD_N];
+
+    for (int i = 0; i < ADD_N; i++) {
+        a[i] = (float)(i + 1);
+        b[i] = (float)(ADD_N - i);  /* 32, 31, ..., 1 */
+    }
+
+    hvx_add_f32(a, b, out, ADD_N);
+
+    uint32_t pass = 1;
+    float max_err = 0;
+    for (int i = 0; i < ADD_N; i++) {
+        float expected = a[i] + b[i];  /* always 33 */
+        float err = out[i] - expected;
+        if (err < 0) err = -err;
+        if (err > max_err) max_err = err;
+    }
+    FARF(HIGH, "  Add max_err=%d/100000", (int)(max_err * 100000));
+    FARF(HIGH, "  Add samples: out[0]=%d/100(exp 3300), out[15]=%d/100(exp 3300)",
+         (int)(out[0] * 100), (int)(out[15] * 100));
+    if (max_err > 0.01f) {
+        FARF(HIGH, "  Add FAIL: error too large");
+        pass = 0;
+    }
+    FARF(HIGH, "Add Test: %s", pass ? "PASS" : "FAIL");
+    return pass;
+}
+
+static uint32_t run_rope_test(void) {
+    FARF(HIGH, "=== RoPE Test ===");
+    /* head_dim=128, pos=0 and pos=1 */
+    #define ROPE_DIM 128
+    #define ROPE_HALF 64
+    #define ROPE_MAX_POS 4
+
+    float __attribute__((aligned(128))) x[ROPE_DIM];
+    float __attribute__((aligned(128))) out[ROPE_DIM];
+    float __attribute__((aligned(128))) cos_tbl[ROPE_MAX_POS * ROPE_HALF];
+    float __attribute__((aligned(128))) sin_tbl[ROPE_MAX_POS * ROPE_HALF];
+
+    /* Build cos/sin tables: theta_i = 1/(10000^(2i/dim)) for i=0..half-1 */
+    for (int pos = 0; pos < ROPE_MAX_POS; pos++) {
+        for (int i = 0; i < ROPE_HALF; i++) {
+            float theta = (float)pos / powf(10000.0f, 2.0f * (float)i / (float)ROPE_DIM);
+            cos_tbl[pos * ROPE_HALF + i] = cosf(theta);
+            sin_tbl[pos * ROPE_HALF + i] = sinf(theta);
+        }
+    }
+
+    /* Test input: x_r = [1,2,...,64], x_i = [65,66,...,128] */
+    for (int i = 0; i < ROPE_DIM; i++) {
+        x[i] = (float)(i + 1);
+    }
+
+    uint32_t pass = 1;
+
+    /* Test pos=0: cos=1, sin=0 for all dims, so out should equal x */
+    hvx_rope_f32(x, cos_tbl, sin_tbl, out, ROPE_DIM, 0);
+    float max_err_p0 = 0;
+    for (int i = 0; i < ROPE_DIM; i++) {
+        float err = out[i] - x[i];
+        if (err < 0) err = -err;
+        if (err > max_err_p0) max_err_p0 = err;
+    }
+    FARF(HIGH, "  RoPE pos=0 max_err=%d/100000 (expect ~0, identity rotation)",
+         (int)(max_err_p0 * 100000));
+    if (max_err_p0 > 0.01f) {
+        FARF(HIGH, "  RoPE pos=0 FAIL");
+        pass = 0;
+    }
+
+    /* Test pos=1: verify against scalar reference */
+    hvx_rope_f32(x, cos_tbl, sin_tbl, out, ROPE_DIM, 1);
+    float max_err_p1 = 0;
+    for (int i = 0; i < ROPE_HALF; i++) {
+        float c = cos_tbl[1 * ROPE_HALF + i];
+        float s = sin_tbl[1 * ROPE_HALF + i];
+        float xr = x[i];
+        float xi = x[ROPE_HALF + i];
+        float ref_r = xr * c - xi * s;
+        float ref_i = xr * s + xi * c;
+        float err_r = out[i] - ref_r;
+        float err_i = out[ROPE_HALF + i] - ref_i;
+        if (err_r < 0) err_r = -err_r;
+        if (err_i < 0) err_i = -err_i;
+        if (err_r > max_err_p1) max_err_p1 = err_r;
+        if (err_i > max_err_p1) max_err_p1 = err_i;
+    }
+    FARF(HIGH, "  RoPE pos=1 max_err=%d/100000", (int)(max_err_p1 * 100000));
+    /* Sample values for inspection */
+    FARF(HIGH, "  RoPE pos=1 out[0]=%d/100, out[64]=%d/100",
+         (int)(out[0] * 100), (int)(out[64] * 100));
+    if (max_err_p1 > 0.5f) {
+        FARF(HIGH, "  RoPE pos=1 FAIL: error too large");
+        pass = 0;
+    }
+
+    FARF(HIGH, "RoPE Test: %s", pass ? "PASS" : "FAIL");
+    return pass;
+}
+
+static uint32_t run_ops_test(void) {
+    FARF(HIGH, "========== F32 Operator Tests ==========");
+    uint32_t p1 = run_rmsnorm_test();
+    uint32_t p2 = run_relu2_test();
+    uint32_t p3 = run_mul_test();
+    uint32_t p4 = run_add_test();
+    uint32_t p5 = run_rope_test();
+
+    uint32_t pass = p1 & p2 & p3 & p4 & p5;
+    FARF(HIGH, "Ops tests: norm=%u relu2=%u mul=%u add=%u rope=%u => %s",
+         p1, p2, p3, p4, p5, pass ? "ALL PASS" : "SOME FAILED");
+    return pass;
+}
+
+static void run_ops_test_dispatch(dspqueue_t queue) {
+    uint32_t pass = run_ops_test();
+
+    struct vlut16_test_rsp rsp;
+    rsp.op = OP_OPS_TEST;
+    rsp.status = 0;
+    rsp.pass = pass;
+
+    dspqueue_write(queue, 0, 0, NULL,
+                   sizeof(rsp), (const uint8_t *)&rsp,
+                   DSPQUEUE_TIMEOUT_NONE);
+}
+
 /* ========== Dispatch ========== */
 
 static void run_gemv_test_dispatch(dspqueue_t queue) {
@@ -589,6 +1072,10 @@ static void packet_callback(dspqueue_t queue, int error, void *context) {
             run_vlut16_test(queue, msg.test_id);
         } else if (msg.op == OP_GEMV_TEST) {
             run_gemv_test_dispatch(queue);
+        } else if (msg.op == OP_ATTN_TEST) {
+            run_attn_test_dispatch(queue);
+        } else if (msg.op == OP_OPS_TEST) {
+            run_ops_test_dispatch(queue);
         } else if (msg.op == OP_EXIT) {
             struct vlut16_test_rsp rsp = { OP_EXIT, 0, 0 };
             dspqueue_write(queue, 0, 0, NULL,

@@ -10,6 +10,8 @@
 /* Op codes */
 #define OP_VLUT16_TEST  1   /* run VLUT16 test on DSP */
 #define OP_GEMV_TEST    2   /* run BitNet GEMV test on DSP */
+#define OP_ATTN_TEST    3   /* run softmax + attention test on DSP */
+#define OP_OPS_TEST     4   /* run f32 operator tests (rmsnorm, relu2, etc.) */
 #define OP_EXIT         99
 
 /* Request: run a VLUT16 test */
