@@ -22,12 +22,13 @@ EXP2_WEIGHT_LAYOUT="$BUILD_DIR/libexp2_weight_layout.so"
 EXP3_STREAMING="$BUILD_DIR/libexp3_streaming.so"
 EXP4_PIPELINE="$BUILD_DIR/libexp4_pipeline.so"
 EXP5_STANDALONE="$BUILD_DIR/libexp5_standalone_asm.so"
+EXP6_INIT_TEST="$BUILD_DIR/libexp6_init_test.so"
 RUN_MAIN="$HEXAGON_SDK/libs/run_main_on_hexagon/ship/android_aarch64/run_main_on_hexagon"
 RUN_MAIN_SKEL="$HEXAGON_SDK/libs/run_main_on_hexagon/ship/hexagon_toolv87_v75/librun_main_on_hexagon_skel.so"
 HEXKL_SKEL="$HEXKL/lib/hexagon_toolv19_v75/libhexkl_skel.so"
 
 # ---- Check build artifacts ----
-for f in "$EXP1_TILE_BASICS" "$EXP2_WEIGHT_LAYOUT" "$EXP3_STREAMING" "$EXP4_PIPELINE" "$EXP5_STANDALONE"; do
+for f in "$EXP1_TILE_BASICS" "$EXP2_WEIGHT_LAYOUT" "$EXP3_STREAMING" "$EXP4_PIPELINE" "$EXP5_STANDALONE" "$EXP6_INIT_TEST"; do
     if [ ! -f "$f" ]; then
         echo "ERROR: $f not found. Run build.sh first."
         exit 1
@@ -55,6 +56,7 @@ adb push "$EXP2_WEIGHT_LAYOUT" "$DEVICE_DIR/"
 adb push "$EXP3_STREAMING"    "$DEVICE_DIR/"
 adb push "$EXP4_PIPELINE"     "$DEVICE_DIR/"
 adb push "$EXP5_STANDALONE"   "$DEVICE_DIR/"
+adb push "$EXP6_INIT_TEST"   "$DEVICE_DIR/"
 adb push "$RUN_MAIN"          "$DEVICE_DIR/"
 adb push "$RUN_MAIN_SKEL"     "$DEVICE_DIR/"
 adb push "$HEXKL_SKEL"        "$DEVICE_DIR/"
@@ -138,3 +140,18 @@ timeout 300 adb shell "cd $DEVICE_DIR && \
 
 sleep 1
 adb logcat -d | grep "\[EXP5\]" | sed 's/.*\[DU\]: //' | tail -40
+
+# ---- Experiment 6: HMX Init Test (DSP-side) ----
+echo ""
+echo "=== Experiment 6: HMX Initialization Test ==="
+echo "    Tests what minimum HMX init is needed for direct ASM compute"
+echo ""
+adb logcat -c
+timeout 300 adb shell "cd $DEVICE_DIR && \
+    DSP_LIBRARY_PATH=$DEVICE_DIR \
+    LD_LIBRARY_PATH=$DEVICE_DIR \
+    ADSP_LIBRARY_PATH=$DEVICE_DIR \
+    ./run_main_on_hexagon 3 libexp6_init_test.so" 2>&1 || echo "(timeout or failed)"
+
+sleep 1
+adb logcat -d | grep "\[EXP6\]" | sed 's/.*\[DU\]: //' | tail -40

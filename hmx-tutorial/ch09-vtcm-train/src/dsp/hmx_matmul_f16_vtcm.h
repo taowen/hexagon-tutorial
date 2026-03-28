@@ -10,10 +10,10 @@
  *   Compute:         ASM mxclracc.hf + mxmem:deep (batch tile loading)
  *   Readback:        ASM cvt.hf + mxmem store + HVX vdeal(-2)
  *
- * Key finding: hexkl_micro_hmx_mm_f16 must be called ONCE during setup
- * to configure hidden HMX registers (beyond what hmx_set_scales does).
- * After that, pure ASM compute works. Do NOT call hmx_set_scales() —
- * it clobbers the mm_f16 configuration and produces garbage.
+ * Key finding: hexkl_micro_hmx_setup_acc_read_f16 configures HMX scale/bias
+ * registers via mxmem2.bias. The dummy mm_f16 call was proven unnecessary —
+ * it's just 2 load instructions with no state effects. Do NOT call
+ * hmx_set_scales() — it clobbers the configuration and produces garbage.
  *
  * HMX tile = 32x32 f16, ALIGN = 2048 bytes.
  */
@@ -70,8 +70,7 @@ struct hmx_workspace {
 
     uint32_t ah_base;       /* AH activation tiles */
     uint32_t wh_base;       /* WH weight tiles */
-    uint32_t staging_off;   /* staging tile (used for HMX init + readback) */
-    uint32_t staging2_off;  /* second staging tile (readback output) */
+    uint32_t staging2_off;  /* staging tile (readback output) */
     uint32_t cfg_off;       /* hexkl config at end of VTCM */
 
     uint32_t max_ah_tiles;
@@ -108,9 +107,6 @@ static int setup_hmx_workspace(struct hmx_workspace *ws,
     ws->max_wh_tiles = HMX_MAX_WH_TILES;
     off += HMX_MAX_WH_TILES * HMX_ALIGN;
 
-    ws->staging_off = (off + HMX_ALIGN - 1) & ~(HMX_ALIGN - 1);
-    off = ws->staging_off + HMX_ALIGN;
-
     ws->staging2_off = (off + HMX_ALIGN - 1) & ~(HMX_ALIGN - 1);
     off = ws->staging2_off + HMX_ALIGN;
 
@@ -123,44 +119,6 @@ static int setup_hmx_workspace(struct hmx_workspace *ws,
 
     ws->cfg_off = vtcm_size - cfg_size;
     hexkl_micro_hmx_setup_acc_read_f16(vtcm_base, ws->cfg_off);
-
-    /*
-     * One-time HMX initialization via dummy hexkl mm_f16.
-     *
-     * hexkl_micro_hmx_mm_f16 configures hidden HMX internal registers
-     * (data type, accumulator format, scale/bias) that are NOT set by
-     * the explicit ASM instructions alone (mxclracc.hf, mxmem).
-     *
-     * CRITICAL: Do NOT call hmx_set_scales() (bias=mxmem2) after this —
-     * it overwrites the scale configuration with an incompatible format,
-     * causing all subsequent matmuls to produce zeros.
-     *
-     * This state persists across hmx_clear_acc and hmx_store_acc_tile calls,
-     * so a single initialization is sufficient for the session lifetime.
-     */
-    {
-        HVX_Vector zero = Q6_V_vzero();
-        HVX_Vector *sv;
-
-        /* Prepare dummy AH tile */
-        sv = (HVX_Vector *)(vtcm_base + ws->staging_off);
-        for (uint32_t i = 0; i < HMX_TILE_BYTES / 128; i++)
-            sv[i] = zero;
-        hexkl_micro_hmx_rm_to_ah_f16(vtcm_base, ws->ah_base, ws->staging_off);
-
-        /* Prepare dummy WH tile using our pure HVX conversion */
-        {
-            _Float16 *staging_f16 = (_Float16 *)(vtcm_base + ws->staging_off);
-            /* staging is already zeroed above; convert as 32x32 tile */
-            convert_rm_to_wh(ws, ws->wh_base, staging_f16, HMX_TILE, HMX_TILE);
-        }
-
-        /* Execute dummy matmul to configure HMX state */
-        hexkl_micro_hmx_acc_clear_f16();
-        hexkl_micro_hmx_mm_f16(vtcm_base, ws->ah_base, ws->wh_base);
-
-        FARF(HIGH, "HMX state initialized via dummy mm_f16");
-    }
 
     FARF(HIGH, "HMX workspace: %uKB (ah=%u wh=%u tiles) data_end=%uKB vtcm=%uKB",
          off / 1024, HMX_MAX_AH_TILES, HMX_MAX_WH_TILES,
@@ -312,7 +270,7 @@ static void readback_acc_to_rm(struct hmx_workspace *ws,
 /*  HMX matmul: C[m,n] = A[m,k] @ B[k,n]                             */
 /*                                                                     */
 /*  Uses batch :deep tile loading (up to 32 tiles per mxmem).         */
-/*  No hmx_set_scales — mm_f16 init in setup provides the config.     */
+/*  No hmx_set_scales — setup_acc_read provides the config via mxmem2.bias. */
 /* ================================================================== */
 
 static void hmx_matmul_nn_f16(
