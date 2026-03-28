@@ -19,6 +19,7 @@
 #include "bitnet_test.h"
 #include "dspqueue.h"
 #include "common/protocol.h"
+#include "dsp/bitnet_gemv.h"
 
 /* ========== DSP context ========== */
 
@@ -26,83 +27,6 @@ struct dsp_ctx {
     dspqueue_t queue;
     uint64_t   total_us;
 };
-
-/* ========== VLUT16 LUT shuffle ========== */
-
-/*
- * Shuffle 16 LUT vectors into the interleaved format that VLUT16 expects.
- *
- * Input:  l_tmp[0..15] — 16 HVX vectors. l_tmp[i] has entry i's value
- *         at each of the 64 int16 positions.
- * Output: out[0..15] — 16 shuffled HVX vectors. Each can be passed
- *         directly to Q6_Wh_vlut16_VbVhR_nomatch as the LUT vector.
- *
- * The shuffle is a 4-step butterfly that interleaves entries at
- * 32-bit, 64-bit, 128-bit, and 256-bit granularity. This matches
- * the hardware's expected layout for 128B HVX mode.
- *
- * Reference: executorch TMANOpPackage/include/hvx_funcs.h, hvx_lut_ctor()
- */
-static void vlut16_shuffle(HVX_Vector l_tmp[16], HVX_Vector out[16]) {
-    HVX_VectorPair l_pa[8];
-    HVX_VectorPair l_pb[8];
-
-    /* Step 1: interleave at 32-bit (4 byte) granularity */
-    for (int i = 0; i < 16; i += 2) {
-        l_pa[i / 2] = Q6_W_vshuff_VVR(l_tmp[i + 1], l_tmp[i], -4);
-    }
-
-    /* Step 2: interleave at 64-bit (8 byte) granularity */
-    for (int i = 0; i < 8; i += 2) {
-        l_pb[i + 0] = Q6_W_vshuff_VVR(Q6_V_lo_W(l_pa[i + 1]), Q6_V_lo_W(l_pa[i + 0]), -8);
-        l_pb[i + 1] = Q6_W_vshuff_VVR(Q6_V_hi_W(l_pa[i + 1]), Q6_V_hi_W(l_pa[i + 0]), -8);
-    }
-
-    /* Step 3: interleave at 128-bit (16 byte) granularity */
-    for (int i = 0; i < 8; i += 4) {
-        l_pa[i + 0] = Q6_W_vshuff_VVR(Q6_V_lo_W(l_pb[i + 2]), Q6_V_lo_W(l_pb[i + 0]), -16);
-        l_pa[i + 1] = Q6_W_vshuff_VVR(Q6_V_hi_W(l_pb[i + 2]), Q6_V_hi_W(l_pb[i + 0]), -16);
-        l_pa[i + 2] = Q6_W_vshuff_VVR(Q6_V_lo_W(l_pb[i + 3]), Q6_V_lo_W(l_pb[i + 1]), -16);
-        l_pa[i + 3] = Q6_W_vshuff_VVR(Q6_V_hi_W(l_pb[i + 3]), Q6_V_hi_W(l_pb[i + 1]), -16);
-    }
-
-    /* Step 4: interleave at 256-bit (32 byte) granularity */
-    for (int i = 0; i < 8; i += 8) {
-        l_pb[i + 0] = Q6_W_vshuff_VVR(Q6_V_lo_W(l_pa[i + 4]), Q6_V_lo_W(l_pa[i + 0]), -32);
-        l_pb[i + 1] = Q6_W_vshuff_VVR(Q6_V_hi_W(l_pa[i + 4]), Q6_V_hi_W(l_pa[i + 0]), -32);
-        l_pb[i + 2] = Q6_W_vshuff_VVR(Q6_V_lo_W(l_pa[i + 5]), Q6_V_lo_W(l_pa[i + 1]), -32);
-        l_pb[i + 3] = Q6_W_vshuff_VVR(Q6_V_hi_W(l_pa[i + 5]), Q6_V_hi_W(l_pa[i + 1]), -32);
-        l_pb[i + 4] = Q6_W_vshuff_VVR(Q6_V_lo_W(l_pa[i + 6]), Q6_V_lo_W(l_pa[i + 2]), -32);
-        l_pb[i + 5] = Q6_W_vshuff_VVR(Q6_V_hi_W(l_pa[i + 6]), Q6_V_hi_W(l_pa[i + 2]), -32);
-        l_pb[i + 6] = Q6_W_vshuff_VVR(Q6_V_lo_W(l_pa[i + 7]), Q6_V_lo_W(l_pa[i + 3]), -32);
-        l_pb[i + 7] = Q6_W_vshuff_VVR(Q6_V_hi_W(l_pa[i + 7]), Q6_V_hi_W(l_pa[i + 3]), -32);
-    }
-
-    /* Extract: each pair's lo and hi are consecutive output vectors */
-    for (int i = 0; i < 8; i++) {
-        out[i * 2]     = Q6_V_lo_W(l_pb[i]);
-        out[i * 2 + 1] = Q6_V_hi_W(l_pb[i]);
-    }
-}
-
-/*
- * Build a shuffled VLUT16 LUT vector from 16 int16 values.
- * All 64 output positions share the same 16-entry table.
- * Returns one shuffled HVX vector ready for VLUT16.
- */
-static HVX_Vector vlut16_build_lut(const int16_t values[16]) {
-    HVX_Vector l_tmp[16];
-    for (int i = 0; i < 16; i++) {
-        l_tmp[i] = Q6_Vh_vsplat_R(values[i]);
-    }
-
-    HVX_Vector shuffled[16];
-    vlut16_shuffle(l_tmp, shuffled);
-
-    /* All 16 output vectors are identical when input is splatted,
-     * so just return the first one. */
-    return shuffled[0];
-}
 
 /* ========== VLUT16 Tests ========== */
 
@@ -316,7 +240,113 @@ static uint32_t run_vlut16_test3(void) {
     return pass;
 }
 
+/* ========== GEMV Test ========== */
+
+/*
+ * Simple LCG random number generator for reproducible test data.
+ * Returns value in [0, 1).
+ */
+static uint32_t rng_state = 12345;
+static float rng_float(void) {
+    rng_state = rng_state * 1103515245 + 12345;
+    return (float)(rng_state >> 16) / 65536.0f;
+}
+
+static uint32_t run_gemv_test(void) {
+    FARF(HIGH, "=== GEMV Test: BitNet GEMV via VLUT16 ===");
+
+    /* Test dimensions: M=256 (two VLUT16 passes), K=256 (64 Q groups) */
+    #define GEMV_M 256
+    #define GEMV_K 256
+    #define GEMV_Q (GEMV_K / 4)
+
+    /* Allocate test data (too large for stack at bigger sizes) */
+    int8_t *W = (int8_t *)malloc(GEMV_M * GEMV_K);
+    float *x = (float *)malloc(GEMV_K * sizeof(float));
+    float *y_ref = (float *)malloc(GEMV_M * sizeof(float));
+    float *y_vlut = (float *)malloc(GEMV_M * sizeof(float));
+    /* packed_w must be 128-byte aligned for HVX */
+    uint8_t *packed_w = (uint8_t *)memalign(128, 2 * GEMV_Q * GEMV_M);
+
+    if (!W || !x || !y_ref || !y_vlut || !packed_w) {
+        FARF(ERROR, "GEMV test: malloc failed");
+        free(W); free(x); free(y_ref); free(y_vlut); free(packed_w);
+        return 0;
+    }
+
+    /* Generate random ternary weights W[M][K] ∈ {-1, 0, +1} */
+    rng_state = 42;
+    for (int i = 0; i < GEMV_M * GEMV_K; i++) {
+        float r = rng_float();
+        if (r < 0.33f) W[i] = -1;
+        else if (r < 0.66f) W[i] = 0;
+        else W[i] = 1;
+    }
+
+    /* Generate random activations x[K] ∈ [-1, 1] */
+    for (int k = 0; k < GEMV_K; k++) {
+        x[k] = rng_float() * 2.0f - 1.0f;
+    }
+
+    /* Reference output (scalar) */
+    bitnet_gemv_reference(x, W, y_ref, GEMV_M, GEMV_K);
+
+    /* Pack weights for VLUT16 */
+    bitnet_pack_weights(W, packed_w, GEMV_M, GEMV_K);
+
+    /* VLUT16 GEMV */
+    uint64_t t_start = HAP_perf_get_time_us();
+    bitnet_gemv(x, packed_w, y_vlut, GEMV_M, GEMV_K);
+    uint64_t t_end = HAP_perf_get_time_us();
+    FARF(HIGH, "GEMV time: %llu us (M=%d, K=%d)", t_end - t_start, GEMV_M, GEMV_K);
+
+    /* Compare results */
+    float max_err = 0;
+    float max_ref = 0;
+    int mismatches = 0;
+    for (int m = 0; m < GEMV_M; m++) {
+        float err = y_vlut[m] - y_ref[m];
+        if (err < 0) err = -err;
+        if (err > max_err) max_err = err;
+        float ref_abs = y_ref[m] > 0 ? y_ref[m] : -y_ref[m];
+        if (ref_abs > max_ref) max_ref = ref_abs;
+        if (err > 0.1f) mismatches++;
+    }
+
+    float rel_err = max_ref > 0 ? max_err / max_ref : 0;
+
+    /* Print first few outputs for inspection */
+    FARF(HIGH, "First 8 outputs (ref vs vlut16):");
+    for (int m = 0; m < 8; m++) {
+        FARF(HIGH, "  y[%d]: ref=%d/1000, vlut=%d/1000, err=%d/1000",
+             m, (int)(y_ref[m] * 1000), (int)(y_vlut[m] * 1000),
+             (int)((y_vlut[m] - y_ref[m]) * 1000));
+    }
+    FARF(HIGH, "Max absolute error: %d/10000", (int)(max_err * 10000));
+    FARF(HIGH, "Max relative error: %d/10000", (int)(rel_err * 10000));
+    FARF(HIGH, "Mismatches (>0.1): %d / %d", mismatches, GEMV_M);
+
+    uint32_t pass = (rel_err < 0.05f) ? 1 : 0;  /* 5% relative error threshold */
+    FARF(HIGH, "GEMV Test: %s (rel_err=%.4f)", pass ? "PASS" : "FAIL", (double)rel_err);
+
+    free(W); free(x); free(y_ref); free(y_vlut); free(packed_w);
+    return pass;
+}
+
 /* ========== Dispatch ========== */
+
+static void run_gemv_test_dispatch(dspqueue_t queue) {
+    uint32_t pass = run_gemv_test();
+
+    struct vlut16_test_rsp rsp;
+    rsp.op = OP_GEMV_TEST;
+    rsp.status = 0;
+    rsp.pass = pass;
+
+    dspqueue_write(queue, 0, 0, NULL,
+                   sizeof(rsp), (const uint8_t *)&rsp,
+                   DSPQUEUE_TIMEOUT_NONE);
+}
 
 static void run_vlut16_test(dspqueue_t queue, uint32_t test_id) {
     FARF(HIGH, "Running VLUT16 tests...");
@@ -366,6 +396,8 @@ static void packet_callback(dspqueue_t queue, int error, void *context) {
 
         if (msg.op == OP_VLUT16_TEST) {
             run_vlut16_test(queue, msg.test_id);
+        } else if (msg.op == OP_GEMV_TEST) {
+            run_gemv_test_dispatch(queue);
         } else if (msg.op == OP_EXIT) {
             struct vlut16_test_rsp rsp = { OP_EXIT, 0, 0 };
             dspqueue_write(queue, 0, 0, NULL,

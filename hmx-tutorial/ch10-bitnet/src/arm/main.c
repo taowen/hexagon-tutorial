@@ -115,10 +115,31 @@ int main(int argc, char **argv) {
     /* Wait for response */
     sem_wait(&g_done);
 
-    printf("\n[ARM] Response: op=%u status=%u pass=%u\n",
+    printf("\n[ARM] VLUT16 Response: op=%u status=%u pass=%u\n",
            g_rsp.op, g_rsp.status, g_rsp.pass);
-    if (g_rsp.pass) {
-        printf("[ARM] *** ALL VLUT16 TESTS PASSED ***\n");
+    int all_pass = g_rsp.pass;
+
+    /* Send GEMV test request */
+    printf("[ARM] Sending GEMV test request...\n");
+    memset(&req, 0, sizeof(req));
+    req.op = OP_GEMV_TEST;
+    req.test_id = 0;
+
+    ret = dspqueue_write(queue, 0, 0, NULL,
+                          sizeof(req), (const uint8_t *)&req, 1000000);
+    if (ret != 0) {
+        fprintf(stderr, "dspqueue_write (GEMV) failed: 0x%08x\n", (unsigned)ret);
+        goto cleanup;
+    }
+
+    sem_wait(&g_done);
+
+    printf("\n[ARM] GEMV Response: op=%u status=%u pass=%u\n",
+           g_rsp.op, g_rsp.status, g_rsp.pass);
+    all_pass &= g_rsp.pass;
+
+    if (all_pass) {
+        printf("[ARM] *** ALL TESTS PASSED ***\n");
     } else {
         printf("[ARM] *** SOME TESTS FAILED -- check logcat for details ***\n");
     }

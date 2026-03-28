@@ -183,28 +183,26 @@ packed[i] = (w0+1) | ((w1+1)<<2) | ((w2+1)<<4) | ((w3+1)<<6)
 
 **产出**：`vlut16_shuffle()` 和 `vlut16_build_lut()` 两个可复用 helper 函数。
 
-### 实验 2：BitNet GEMV 完整内核
+### 实验 2：BitNet GEMV 完整内核 ✅
 
-**目标**：从 fp16 激活 + packed 三值权重，到 fp16 输出，一个完整的 BitNet 线性层。
+**状态**：完成。M=256, K=256 真机验证 0 mismatches，max relative error < 0.01%。
 
-这是本章的核心内核，包含三个阶段：
+实现了完整的三阶段 BitNet GEMV：
 
-**阶段 1 — LUT 构建**（`hvx_lut_ctor`）：
-- 每 4 个激活分组，预计算 16 种二值组合的点积
-- 镜像优化：只算 8 个奇数项，偶数项取反
-- 量化到 int16 + vshuff 交错排列
+**阶段 1 — LUT 构建**：每 4 个激活分组，预计算 16 种 ±x 组合的点积，量化到 int16，vshuff 交错排列。
 
-**阶段 2 — VLUT16 查表累加**（`hvx_tbl`）：
-- 权重字节拆成高低 4-bit 索引 → VLUT16 并行查表
-- int16 结果 widen 到 int32 累加
-- 块边界处 flush：int32 → float → ×scale → +bias → qf32 累加
+**阶段 2 — VLUT16 查表**：packed 权重的 4-bit nibble 作为索引，VLUT16 并行查 128 个输出维度的结果。int16 结果乘以量化 scale 后累加到 float。
 
-**阶段 3 — bit-serial 合并**（`hvx_bit_serial`）：
-- 三值权重分为 2 个 bit plane，各做一次查表累加
-- 合并：`output = 0.5 × partial_bit0 + partial_bit1 + lb`
+**阶段 3 — bit-serial 合并**：三值权重编码为 2 bit planes（enc = w + 2），各做一次查表累加，合并公式：`output = 0.5 × partial_bit0 + partial_bit1 - 0.5 × sum(x)`。
 
-**验证**：用 Python 参考实现逐元素对比，误差 < 1%
-**性能**：测量 M=6912, K=2560 的 GEMV 延迟，对比反量化乘加方案
+**关键推导**：ternary w ∈ {-1,0,+1} 编码为 enc = w+2 ∈ {1,2,3}，拆成 bit0/bit1 后 w = bit0 + 2×bit1 - 2。VLUT16 的 LUT 计算 ±x 的所有组合，偏置项 lb = -0.5×sum(x) 补偿编码偏移。
+
+**产出**：`bitnet_gemv.h` 包含 `bitnet_pack_weights()`、`bitnet_gemv()`、`bitnet_gemv_reference()` 三个函数。
+
+**性能**（当前未优化版本）：M=256, K=256 耗时 293 us。下一步需要：
+- HVX 向量化 LUT 构建和累加（当前是标量 float 循环）
+- int32 累加跨多个 Q 位置（减少 float 转换次数）
+- executorch 的 4Q 打包优化（每次处理 4 个 Q 位置）
 
 ### 实验 3：Decoder Layer 完整组件
 
@@ -312,7 +310,8 @@ ch10-bitnet/
     ├── arm/
     │   └── main.c                 # ARM 驱动（dspqueue 初始化、消息发送）
     └── dsp/
-        └── skel.c                 # DSP 端（VLUT16 测试 + vlut16_shuffle helper）
+        ├── skel.c                 # DSP 端（测试调度 + 实验 1 VLUT16 测试）
+        └── bitnet_gemv.h          # 实验 2：BitNet GEMV 内核（pack + gemv + reference）
 ```
 
 ## 8. 关键问题与风险
