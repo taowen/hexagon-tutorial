@@ -21,6 +21,7 @@
 #include "common/protocol.h"
 #include "dsp/bitnet_gemv.h"
 #include "dsp/bitnet_ops.h"
+#include "dsp/bitnet_decoder.h"
 
 /* ========== DSP context ========== */
 
@@ -1007,6 +1008,141 @@ static void run_ops_test_dispatch(dspqueue_t queue) {
                    DSPQUEUE_TIMEOUT_NONE);
 }
 
+/* ========== Decoder Layer Test ========== */
+
+/*
+ * Run decoder layer test using weights from shared memory buffer.
+ * The buffer starts with a WeightLayout header followed by all weight data.
+ *
+ * bufs[0].ptr points to the shared buffer.
+ */
+static void run_decoder_test(dspqueue_t queue, struct dspqueue_buffer *bufs, uint32_t n_bufs) {
+    struct vlut16_test_rsp rsp;
+    rsp.op = OP_DECODER_TEST;
+    rsp.status = 0;
+    rsp.pass = 0;
+
+    if (n_bufs < 1 || !bufs[0].ptr) {
+        FARF(ERROR, "Decoder test: no shared buffer received");
+        rsp.status = 1;
+        goto respond;
+    }
+
+    {
+        uint8_t *base = (uint8_t *)bufs[0].ptr;
+        const WeightLayout *layout = (const WeightLayout *)base;
+
+        FARF(HIGH, "=== Decoder Layer Test ===");
+        FARF(HIGH, "Buffer size: %u bytes, pos=%u, kv_seq_len=%u, kv_max_seq=%u",
+             layout->total_size, layout->pos, layout->kv_seq_len, layout->kv_max_seq_len);
+
+        /* Parse weight pointers from offsets */
+        DecoderLayerWeights weights;
+        weights.q_proj_w        = (const uint8_t *)(base + layout->q_proj_offset);
+        weights.k_proj_w        = (const uint8_t *)(base + layout->k_proj_offset);
+        weights.v_proj_w        = (const uint8_t *)(base + layout->v_proj_offset);
+        weights.o_proj_w        = (const uint8_t *)(base + layout->o_proj_offset);
+        weights.gate_proj_w     = (const uint8_t *)(base + layout->gate_proj_offset);
+        weights.up_proj_w       = (const uint8_t *)(base + layout->up_proj_offset);
+        weights.down_proj_w     = (const uint8_t *)(base + layout->down_proj_offset);
+        weights.input_ln_w      = (const float *)(base + layout->input_ln_offset);
+        weights.post_attn_ln_w  = (const float *)(base + layout->post_attn_ln_offset);
+        weights.attn_sub_norm_w = (const float *)(base + layout->attn_sub_norm_offset);
+        weights.ffn_sub_norm_w  = (const float *)(base + layout->ffn_sub_norm_offset);
+        weights.rope_cos        = (const float *)(base + layout->rope_cos_offset);
+        weights.rope_sin        = (const float *)(base + layout->rope_sin_offset);
+
+        /* Copy input (we will modify it in-place) */
+        const float *input_src = (const float *)(base + layout->input_offset);
+        const float *ref_output = (const float *)(base + layout->ref_output_offset);
+
+        float *x = (float *)memalign(128, HIDDEN_SIZE * sizeof(float));
+        if (!x) {
+            FARF(ERROR, "Decoder test: malloc failed for input");
+            rsp.status = 2;
+            goto respond;
+        }
+        memcpy(x, input_src, HIDDEN_SIZE * sizeof(float));
+
+        /* Set up KV cache -- points into the shared buffer (writable) */
+        KVCache kv;
+        kv.k_cache     = (float *)(base + layout->k_cache_offset);
+        kv.v_cache     = (float *)(base + layout->v_cache_offset);
+        kv.max_seq_len = (int)layout->kv_max_seq_len;
+        kv.seq_len     = (int)layout->kv_seq_len;
+
+        int pos = (int)layout->pos;
+
+        FARF(HIGH, "Input[0..3]: %d %d %d %d (x1000)",
+             (int)(x[0] * 1000), (int)(x[1] * 1000),
+             (int)(x[2] * 1000), (int)(x[3] * 1000));
+
+        /* Run decoder layer */
+        uint64_t t_start = HAP_perf_get_time_us();
+        bitnet_decoder_layer(x, pos, &weights, &kv);
+        uint64_t t_end = HAP_perf_get_time_us();
+
+        FARF(HIGH, "Decoder layer time: %llu us", t_end - t_start);
+
+        /* Compare output with reference */
+        float max_abs_err = 0;
+        float max_abs_ref = 0;
+        int mismatch_count = 0;
+
+        for (int i = 0; i < HIDDEN_SIZE; i++) {
+            float err = x[i] - ref_output[i];
+            if (err < 0) err = -err;
+            if (err > max_abs_err) max_abs_err = err;
+
+            float ra = ref_output[i] > 0 ? ref_output[i] : -ref_output[i];
+            if (ra > max_abs_ref) max_abs_ref = ra;
+
+            if (err > 1.0f) mismatch_count++;
+        }
+
+        float rel_err = max_abs_ref > 0 ? max_abs_err / max_abs_ref : 0;
+
+        FARF(HIGH, "Output[0..3]:    %d %d %d %d (x1000)",
+             (int)(x[0] * 1000), (int)(x[1] * 1000),
+             (int)(x[2] * 1000), (int)(x[3] * 1000));
+        FARF(HIGH, "Reference[0..3]: %d %d %d %d (x1000)",
+             (int)(ref_output[0] * 1000), (int)(ref_output[1] * 1000),
+             (int)(ref_output[2] * 1000), (int)(ref_output[3] * 1000));
+        FARF(HIGH, "Max abs error: %d/10000, max ref: %d/10000",
+             (int)(max_abs_err * 10000), (int)(max_abs_ref * 10000));
+        FARF(HIGH, "Relative error: %d/10000", (int)(rel_err * 10000));
+        FARF(HIGH, "Mismatches (>1.0): %d / %d", mismatch_count, HIDDEN_SIZE);
+
+        /* Pass criterion: relative error < 10%
+         * BitNet VLUT16 int16 quantization introduces ~1-5% error,
+         * and qf32 adds another ~0.1% per op. With 7 GEMV + multiple
+         * norms in a decoder layer, 10% total is reasonable. */
+        uint32_t pass = (rel_err < 0.10f && mismatch_count == 0) ? 1 : 0;
+        FARF(HIGH, "Decoder Layer Test: %s (rel_err=%.4f, time=%llu us)",
+             pass ? "PASS" : "FAIL", (double)rel_err, t_end - t_start);
+
+        rsp.pass = pass;
+        free(x);
+    }
+
+respond:
+    {
+        /* Deref the shared buffer */
+        struct dspqueue_buffer rsp_bufs[1];
+        memset(rsp_bufs, 0, sizeof(rsp_bufs));
+        int n_rsp_bufs = 0;
+        if (n_bufs >= 1) {
+            rsp_bufs[0].fd = bufs[0].fd;
+            rsp_bufs[0].flags = DSPQUEUE_BUFFER_FLAG_DEREF;
+            n_rsp_bufs = 1;
+        }
+
+        dspqueue_write(queue, 0, n_rsp_bufs, rsp_bufs,
+                       sizeof(rsp), (const uint8_t *)&rsp,
+                       DSPQUEUE_TIMEOUT_NONE);
+    }
+}
+
 /* ========== Dispatch ========== */
 
 static void run_gemv_test_dispatch(dspqueue_t queue) {
@@ -1053,7 +1189,11 @@ static void packet_callback(dspqueue_t queue, int error, void *context) {
     struct dsp_ctx *ctx = (struct dsp_ctx *)context;
 
     while (1) {
-        struct vlut16_test_req msg;
+        /* Use a union to handle all possible message types */
+        union {
+            struct vlut16_test_req  vlut;
+            struct decoder_test_req decoder;
+        } msg;
         uint32_t flags, msg_len, n_bufs;
         struct dspqueue_buffer bufs[MAX_BUFFERS];
 
@@ -1066,24 +1206,27 @@ static void packet_callback(dspqueue_t queue, int error, void *context) {
             return;
         }
 
+        uint32_t op = msg.vlut.op;  /* op is always the first field */
         uint64_t t1 = HAP_perf_get_time_us();
 
-        if (msg.op == OP_VLUT16_TEST) {
-            run_vlut16_test(queue, msg.test_id);
-        } else if (msg.op == OP_GEMV_TEST) {
+        if (op == OP_VLUT16_TEST) {
+            run_vlut16_test(queue, msg.vlut.test_id);
+        } else if (op == OP_GEMV_TEST) {
             run_gemv_test_dispatch(queue);
-        } else if (msg.op == OP_ATTN_TEST) {
+        } else if (op == OP_ATTN_TEST) {
             run_attn_test_dispatch(queue);
-        } else if (msg.op == OP_OPS_TEST) {
+        } else if (op == OP_OPS_TEST) {
             run_ops_test_dispatch(queue);
-        } else if (msg.op == OP_EXIT) {
+        } else if (op == OP_DECODER_TEST) {
+            run_decoder_test(queue, bufs, n_bufs);
+        } else if (op == OP_EXIT) {
             struct vlut16_test_rsp rsp = { OP_EXIT, 0, 0 };
             dspqueue_write(queue, 0, 0, NULL,
                            sizeof(rsp), (const uint8_t *)&rsp,
                            DSPQUEUE_TIMEOUT_NONE);
         } else {
-            FARF(ERROR, "Unknown op %u", msg.op);
-            struct vlut16_test_rsp rsp = { msg.op, (uint32_t)AEE_EBADPARM, 0 };
+            FARF(ERROR, "Unknown op %u", op);
+            struct vlut16_test_rsp rsp = { op, (uint32_t)AEE_EBADPARM, 0 };
             dspqueue_write(queue, 0, 0, NULL,
                            sizeof(rsp), (const uint8_t *)&rsp,
                            DSPQUEUE_TIMEOUT_NONE);

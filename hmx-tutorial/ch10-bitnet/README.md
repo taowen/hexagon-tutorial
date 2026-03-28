@@ -261,9 +261,9 @@ MLP (SiLU gate)          MLP (ReLU² gate) + ffn_sub_norm
 
 **产出**：`bitnet_ops.h` 包含全部 9 个函数，可直接用于组装 decoder layer。
 
-### 实验 4：单层 Decoder 端到端
+### 实验 4：单层 Decoder 端到端 ✅
 
-**目标**：组装一个完整的 decoder layer，加载真实权重，验证正确性。
+**状态**：完成。真实 BitNet 权重加载 + 完整 decoder layer，DSP vs PyTorch 相对误差 **0.14%**。
 
 完整数据流（decode 一个 token）：
 ```
@@ -285,8 +285,27 @@ output [1, 2560]
 
 一层包含 **7 个 BitNet GEMV** + 若干 HVX 向量算子。
 
-**权重加载**：Python 脚本从 HuggingFace 下载模型，转换为 packed 二进制格式，adb push 到设备。
-**验证**：对比 PyTorch `model.layers[0](x)` 的输出，误差 < 0.1%。
+**权重准备**：`prepare_weights.py` 从 HuggingFace 下载 `microsoft/bitnet-b1.58-2B-4T`，解包三值权重（{-1,0,1}），重新打包为 DSP 格式，生成 33.2 MB 的 `decoder_layer.bin`（包含 WeightLayout 头 + 所有权重 + 测试输入/参考输出 + RoPE 表 + KV Cache）。
+
+**HF 权重格式**：packed `[M/4, K]` uint8，每字节 4 个 2-bit 值，块排列（不是交错排列）。三值分布约 25-31% 各 ±1，38-50% 为 0。
+
+**验证结果**（pos=0, seq_len=1 decode）：
+```
+Output[0..3]:    -407.316  -121.177  -20.016  -43.398
+Reference[0..3]: -407.287  -121.323  -19.897  -43.763
+Max abs error:   0.73
+Relative error:  0.14%
+Mismatches:      0 / 2560
+```
+
+**性能**：单层 decoder = **98.6 ms**（未优化，7 个 GEMV 占主导）。
+- 7 个 GEMV（尺寸 2560×2560 到 6912×2560），每个约 10-14 ms
+- 30 层 × 98.6 ms ≈ 3 秒/token（~0.3 tok/s），需要优化
+
+**产出**：
+- `bitnet_decoder.h`：完整 decoder layer 函数
+- `prepare_weights.py`：权重下载、打包、参考计算
+- ARM 共享内存传输：`rpcmem_alloc` + `fastrpc_mmap` + dspqueue buffer ref
 
 ### 实验 5：完整推理 — 文本输入到文本输出
 
@@ -333,16 +352,20 @@ ch10-bitnet/
 ├── README.md
 ├── build.sh
 ├── run_device.sh
+├── prepare_weights.py             # 权重下载、打包、参考输出生成
+├── weights/                       # (gitignored) 二进制权重文件
+│   └── decoder_layer.bin          # 33.2 MB: WeightLayout头 + 所有权重 + 测试数据
 └── src/
     ├── bitnet_test.idl            # FastRPC 接口（dspqueue bootstrap）
     ├── common/
-    │   └── protocol.h             # 消息协议（操作码、请求/响应结构）
+    │   └── protocol.h             # 消息协议 + WeightLayout 共享内存头
     ├── arm/
-    │   └── main.c                 # ARM 驱动（dspqueue 初始化、消息发送）
+    │   └── main.c                 # ARM 驱动（rpcmem 共享内存 + dspqueue）
     └── dsp/
         ├── skel.c                 # DSP 端（测试调度 + 全部实验测试）
-        ├── bitnet_gemv.h          # 实验 2：BitNet GEMV 内核（pack + gemv + reference）
-        └── bitnet_ops.h           # 实验 3：9 个 HVX f32 算子（RMSNorm/RoPE/Softmax/Attention 等）
+        ├── bitnet_gemv.h          # 实验 2：BitNet GEMV 内核
+        ├── bitnet_ops.h           # 实验 3：9 个 HVX f32 算子
+        └── bitnet_decoder.h       # 实验 4：完整 decoder layer
 ```
 
 ## 8. 关键问题与风险
