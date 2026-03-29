@@ -22,6 +22,7 @@
 #include "dsp/bitnet_gemv.h"
 #include "dsp/bitnet_ops.h"
 #include "dsp/bitnet_decoder.h"
+#include "dsp/bitnet_model.h"
 
 /* ========== DSP context ========== */
 
@@ -29,6 +30,12 @@ struct dsp_ctx {
     dspqueue_t queue;
     uint64_t   total_us;
 };
+
+/* ========== Global model state for inference (experiment 5) ========== */
+
+static BitNetModel g_model;
+static int g_model_loaded = 0;
+static int g_model_buf_fd = -1;  /* fd of the shared buffer (kept referenced) */
 
 /* ========== VLUT16 Tests ========== */
 
@@ -1179,6 +1186,192 @@ static void run_vlut16_test(dspqueue_t queue, uint32_t test_id) {
                    DSPQUEUE_TIMEOUT_NONE);
 }
 
+/* ========== Model Loading (experiment 5) ========== */
+
+/*
+ * Parse the ModelHeader from the shared buffer and populate the global
+ * BitNetModel struct with pointers into the buffer.
+ *
+ * The buffer remains referenced (no DEREF) so the DSP can access the
+ * weight data during subsequent OP_FORWARD calls.
+ */
+static void run_load_model(dspqueue_t queue, struct dspqueue_buffer *bufs,
+                            uint32_t n_bufs) {
+    struct load_model_rsp rsp;
+    rsp.op = OP_LOAD_MODEL;
+    rsp.status = 1;  /* assume failure */
+
+    if (n_bufs < 1 || !bufs[0].ptr) {
+        FARF(ERROR, "load_model: no shared buffer received");
+        goto respond;
+    }
+
+    {
+        uint8_t *base = (uint8_t *)bufs[0].ptr;
+        const ModelHeader *hdr = (const ModelHeader *)base;
+
+        FARF(HIGH, "=== Loading Model ===");
+
+        /* Validate magic */
+        if (hdr->magic != MODEL_MAGIC) {
+            FARF(ERROR, "load_model: bad magic 0x%08x (expected 0x%08x)",
+                 hdr->magic, MODEL_MAGIC);
+            goto respond;
+        }
+
+        FARF(HIGH, "Model: %u layers, hidden=%u, inter=%u, "
+             "heads=%u, kv_heads=%u, head_dim=%u, max_seq=%u",
+             hdr->num_layers, hdr->hidden_size,
+             hdr->intermediate_size, hdr->num_heads, hdr->num_kv_heads,
+             hdr->head_dim, hdr->max_seq_len);
+
+        /* Sanity checks */
+        if (hdr->num_layers > NUM_LAYERS) {
+            FARF(ERROR, "load_model: too many layers %u (max %d)",
+                 hdr->num_layers, NUM_LAYERS);
+            goto respond;
+        }
+        if (hdr->hidden_size != HIDDEN_SIZE ||
+            hdr->intermediate_size != INTERMEDIATE_SIZE ||
+            hdr->num_heads != NUM_HEADS ||
+            hdr->num_kv_heads != NUM_KV_HEADS ||
+            hdr->head_dim != HEAD_DIM) {
+            FARF(ERROR, "load_model: model dimensions mismatch compiled constants");
+            goto respond;
+        }
+
+        /* Free any previous KV caches */
+        if (g_model_loaded) {
+            bitnet_model_free_kv(&g_model);
+            g_model_loaded = 0;
+        }
+
+        memset(&g_model, 0, sizeof(g_model));
+
+        /* Set global model pointers (no embedding -- ARM handles that) */
+        g_model.final_norm_w  = (const float *)(base + hdr->final_norm_offset);
+        g_model.rope_cos      = (const float *)(base + hdr->rope_cos_offset);
+        g_model.rope_sin      = (const float *)(base + hdr->rope_sin_offset);
+        g_model.num_layers    = (int)hdr->num_layers;
+
+        /* Parse per-layer weights */
+        for (int l = 0; l < (int)hdr->num_layers; l++) {
+            uint8_t *layer_base = base + hdr->layer_offsets[l];
+            const LayerWeightLayout *lw = (const LayerWeightLayout *)layer_base;
+
+            DecoderLayerWeights *w = &g_model.layers[l];
+            w->q_proj_w        = (const uint8_t *)(layer_base + lw->q_proj_offset);
+            w->k_proj_w        = (const uint8_t *)(layer_base + lw->k_proj_offset);
+            w->v_proj_w        = (const uint8_t *)(layer_base + lw->v_proj_offset);
+            w->o_proj_w        = (const uint8_t *)(layer_base + lw->o_proj_offset);
+            w->gate_proj_w     = (const uint8_t *)(layer_base + lw->gate_proj_offset);
+            w->up_proj_w       = (const uint8_t *)(layer_base + lw->up_proj_offset);
+            w->down_proj_w     = (const uint8_t *)(layer_base + lw->down_proj_offset);
+            w->input_ln_w      = (const float *)(layer_base + lw->input_ln_offset);
+            w->post_attn_ln_w  = (const float *)(layer_base + lw->post_attn_ln_offset);
+            w->attn_sub_norm_w = (const float *)(layer_base + lw->attn_sub_norm_offset);
+            w->ffn_sub_norm_w  = (const float *)(layer_base + lw->ffn_sub_norm_offset);
+
+            /* All layers share the same RoPE tables */
+            w->rope_cos = g_model.rope_cos;
+            w->rope_sin = g_model.rope_sin;
+        }
+
+        /* Allocate KV caches */
+        int max_seq = (int)hdr->max_seq_len;
+        if (max_seq > MAX_SEQ_LEN) max_seq = MAX_SEQ_LEN;
+
+        FARF(HIGH, "Allocating KV caches: %d layers x %d positions ...",
+             g_model.num_layers, max_seq);
+
+        if (bitnet_model_init_kv(&g_model, max_seq) != 0) {
+            FARF(ERROR, "load_model: KV cache allocation failed");
+            goto respond;
+        }
+
+        /* Remember the buffer fd so we can deref it later */
+        g_model_buf_fd = bufs[0].fd;
+        g_model_loaded = 1;
+        rsp.status = 0;
+
+        FARF(HIGH, "Model loaded successfully (%d layers, max_seq=%d)",
+             g_model.num_layers, max_seq);
+    }
+
+respond:
+    /* NOTE: we do NOT deref the buffer here -- the DSP keeps it mapped
+     * so weight pointers remain valid for OP_FORWARD calls. */
+    dspqueue_write(queue, 0, 0, NULL,
+                   sizeof(rsp), (const uint8_t *)&rsp,
+                   DSPQUEUE_TIMEOUT_NONE);
+}
+
+/* ========== Forward pass: decoder layers + final norm (experiment 5) ========== */
+
+static void run_forward(dspqueue_t queue, int32_t position,
+                         struct dspqueue_buffer *bufs, uint32_t n_bufs) {
+    struct forward_rsp rsp;
+    memset(&rsp, 0, sizeof(rsp));
+    rsp.op = OP_FORWARD;
+    rsp.status = 1;  /* assume failure */
+
+    if (!g_model_loaded) {
+        FARF(ERROR, "forward: model not loaded");
+        goto respond;
+    }
+
+    if (n_bufs < 1 || !bufs[0].ptr) {
+        FARF(ERROR, "forward: no hidden state buffer received");
+        goto respond;
+    }
+
+    if (position < 0 || position >= g_model.max_seq_len) {
+        FARF(ERROR, "forward: position %d out of range [0, %d)",
+             position, g_model.max_seq_len);
+        goto respond;
+    }
+
+    {
+        float *hidden = (float *)bufs[0].ptr;
+
+        uint64_t t_start = HAP_perf_get_time_us();
+        bitnet_layers_forward(&g_model, hidden, position);
+        uint64_t t_end = HAP_perf_get_time_us();
+
+        rsp.status = 0;
+        rsp.total_time_us  = (uint32_t)(t_end - t_start);
+        rsp.layers_time_us = rsp.total_time_us;
+
+        FARF(HIGH, "forward: pos=%d total=%u us",
+             position, rsp.total_time_us);
+    }
+
+respond:
+    dspqueue_write(queue, 0, 0, NULL,
+                   sizeof(rsp), (const uint8_t *)&rsp,
+                   DSPQUEUE_TIMEOUT_NONE);
+}
+
+/* ========== KV Cache Reset (experiment 5) ========== */
+
+static void run_reset_kv(dspqueue_t queue) {
+    struct reset_kv_rsp rsp;
+    rsp.op = OP_RESET_KV;
+    rsp.status = 1;
+
+    if (g_model_loaded) {
+        bitnet_model_reset_kv(&g_model);
+        rsp.status = 0;
+        FARF(HIGH, "KV caches reset");
+    } else {
+        FARF(ERROR, "reset_kv: model not loaded");
+    }
+
+    dspqueue_write(queue, 0, 0, NULL,
+                   sizeof(rsp), (const uint8_t *)&rsp,
+                   DSPQUEUE_TIMEOUT_NONE);
+}
+
 /* ========== dspqueue callback ========== */
 
 static void error_callback(dspqueue_t queue, int error, void *context) {
@@ -1193,6 +1386,9 @@ static void packet_callback(dspqueue_t queue, int error, void *context) {
         union {
             struct vlut16_test_req  vlut;
             struct decoder_test_req decoder;
+            struct load_model_req   load;
+            struct forward_req      fwd;
+            struct reset_kv_req     reset;
         } msg;
         uint32_t flags, msg_len, n_bufs;
         struct dspqueue_buffer bufs[MAX_BUFFERS];
@@ -1219,6 +1415,12 @@ static void packet_callback(dspqueue_t queue, int error, void *context) {
             run_ops_test_dispatch(queue);
         } else if (op == OP_DECODER_TEST) {
             run_decoder_test(queue, bufs, n_bufs);
+        } else if (op == OP_LOAD_MODEL) {
+            run_load_model(queue, bufs, n_bufs);
+        } else if (op == OP_FORWARD) {
+            run_forward(queue, msg.fwd.position, bufs, n_bufs);
+        } else if (op == OP_RESET_KV) {
+            run_reset_kv(queue);
         } else if (op == OP_EXIT) {
             struct vlut16_test_rsp rsp = { OP_EXIT, 0, 0 };
             dspqueue_write(queue, 0, 0, NULL,
@@ -1304,6 +1506,14 @@ AEEResult bitnet_test_stop(remote_handle64 handle, uint64 *process_time) {
     int err = dspqueue_close(ctx->queue);
     ctx->queue = NULL;
     if (err) return err;
+
+    /* Free model KV caches if loaded */
+    if (g_model_loaded) {
+        bitnet_model_free_kv(&g_model);
+        g_model_loaded = 0;
+        g_model_buf_fd = -1;
+        FARF(HIGH, "bitnet_test_stop: model KV caches freed");
+    }
 
     FARF(HIGH, "bitnet_test_stop: total DSP time = %llu us", ctx->total_us);
     *process_time = ctx->total_us;
